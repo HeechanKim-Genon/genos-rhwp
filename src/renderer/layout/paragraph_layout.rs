@@ -77,6 +77,30 @@ pub(crate) fn resolve_last_tab_pending(
     }
 }
 
+fn suppress_hanging_list_leading_spaces(text: &str, indent: f64, line_idx: usize, start_line: usize, run_idx: usize) -> bool {
+    if indent >= 0.0 || line_idx != start_line || start_line != 0 || run_idx != 0 {
+        return false;
+    }
+
+    let trimmed = text.trim_start_matches(' ');
+    if trimmed.len() == text.len() {
+        return false;
+    }
+
+    let mut chars = trimmed.chars().peekable();
+    let mut saw_digit = false;
+    while matches!(chars.peek(), Some(c) if c.is_ascii_digit()) {
+        saw_digit = true;
+        chars.next();
+    }
+
+    if !saw_digit {
+        return false;
+    }
+
+    matches!(chars.next(), Some('.') | Some(')'))
+}
+
 impl LayoutEngine {
     pub(crate) fn layout_inline_table_paragraph(
         &self,
@@ -861,6 +885,14 @@ impl LayoutEngine {
             } else {
                 y
             };
+            let effective_col_area = LayoutRect {
+                x: effective_col_x,
+                y: col_area.y,
+                width: effective_col_w,
+                height: col_area.height,
+            };
+            let (float_left_pad, float_right_pad) =
+                self.float_exclusion_pads(&effective_col_area, text_y, line_height);
             // Task #332 Stage 4b: clamp 제거. 단 하단을 초과하는 줄은 그대로 그린다
             // (시각 경계 약간 넘김 허용). 기존의 `text_y = col_bottom - line_height`
             // 클램프는 여러 overflow 줄을 같은 y 에 piling 해 글자 겹침을 만들었으나,
@@ -882,9 +914,14 @@ impl LayoutEngine {
                     TextLineNode::with_para_vpos(line_height, baseline, section_index, para_index, line_idx as u32, vpos)
                 }),
                 BoundingBox::new(
-                    effective_col_x + effective_margin_left,
+                    effective_col_x + effective_margin_left + float_left_pad,
                     text_y,
-                    effective_col_w - effective_margin_left - margin_right,
+                    (effective_col_w
+                        - effective_margin_left
+                        - margin_right
+                        - float_left_pad
+                        - float_right_pad)
+                        .max(0.0),
                     line_height,
                 ),
             );
@@ -892,12 +929,19 @@ impl LayoutEngine {
             let inline_offset = if line_idx == start_line { first_line_x_offset } else { 0.0 };
             // 번호/글머리표 마커: 모든 줄에서 마커 폭만큼 가용폭 차감 (행잉 인덴트)
             let num_offset = if numbering_width > 0.0 { numbering_width } else { 0.0 };
-            let available_width = effective_col_w - effective_margin_left - margin_right - inline_offset - num_offset;
+            let available_width = (effective_col_w
+                - effective_margin_left
+                - margin_right
+                - float_left_pad
+                - float_right_pad
+                - inline_offset
+                - num_offset)
+                .max(0.0);
 
 
             // 텍스트 정렬을 위한 전체 줄 폭 계산 (자연 폭, 추가 간격 미포함)
             // treat_as_char 이미지 폭도 포함하여 정확한 폭 산출
-            let mut est_x = effective_margin_left + inline_offset;
+            let mut est_x = effective_margin_left + float_left_pad + inline_offset;
             let est_x_start = est_x;
             let mut pending_right_tab_est: Option<(f64, u8, u8)> = None;
             let mut run_char_pos_est = comp_line.char_start;
@@ -1199,15 +1243,15 @@ impl LayoutEngine {
             } else { 0.0 };
             let x_start = match alignment {
                 Alignment::Center => {
-                    effective_col_x + effective_margin_left + inline_offset + num_x_offset + (available_width - effective_text_width).max(0.0) / 2.0
+                    effective_col_x + effective_margin_left + float_left_pad + inline_offset + num_x_offset + (available_width - effective_text_width).max(0.0) / 2.0
                 }
                 Alignment::Distribute if !needs_distribute || total_char_count <= 1 => {
-                    effective_col_x + effective_margin_left + inline_offset + num_x_offset + (available_width - effective_text_width).max(0.0) / 2.0
+                    effective_col_x + effective_margin_left + float_left_pad + inline_offset + num_x_offset + (available_width - effective_text_width).max(0.0) / 2.0
                 }
                 Alignment::Right => {
-                    effective_col_x + effective_margin_left + inline_offset + num_x_offset + (available_width - effective_text_width).max(0.0)
+                    effective_col_x + effective_margin_left + float_left_pad + inline_offset + num_x_offset + (available_width - effective_text_width).max(0.0)
                 }
-                _ => effective_col_x + effective_margin_left + inline_offset + num_x_offset, // Left, Justify, Split, Distribute(분배중)
+                _ => effective_col_x + effective_margin_left + float_left_pad + inline_offset + num_x_offset, // Left, Justify, Split, Distribute(분배중)
             };
 
             // TextRun 노드 생성
@@ -1486,8 +1530,18 @@ impl LayoutEngine {
                 if run_tacs.is_empty() {
                     // tac 없음: 기존 렌더링 경로
                     // 선행 공백 분리
-                    let leading_spaces: String = run.text.chars().take_while(|c| *c == ' ').collect();
-                    let content = run.text.trim_start_matches(' ');
+                    let suppress_leading_spaces =
+                        suppress_hanging_list_leading_spaces(&run.text, indent, line_idx, start_line, run_idx);
+                    let leading_spaces: String = if suppress_leading_spaces {
+                        String::new()
+                    } else {
+                        run.text.chars().take_while(|c| *c == ' ').collect()
+                    };
+                    let content = if suppress_leading_spaces {
+                        run.text.as_str()
+                    } else {
+                        run.text.trim_start_matches(' ')
+                    };
 
                     // 글자 테두리/배경: bbox 계산용 run_x, run_w
                     let (run_x, run_w) = if !leading_spaces.is_empty() && !content.is_empty() {
@@ -2903,11 +2957,15 @@ impl LayoutEngine {
     }
 }
 
-/// HWP PUA 문자(0xF000~0xF0FF)를 표준 Unicode로 매핑
+/// HWP PUA 문자(주로 0xF000~0xF0FF)를 표준 Unicode로 매핑
 /// 기준: Wingdings 폰트 → Unicode 매핑 (alanwood.net/demos/wingdings.html)
-/// HWP 글머리표는 Wingdings 폰트 문자를 PUA(0xF000+code)로 저장
+/// HWP 글머리표는 Wingdings 폰트 문자를 PUA(0xF000+code)로 저장한다.
+/// 일부 문서는 BMP PUA 외의 보조 PUA 문자도 사용하므로, 자주 보이는 값은 별도 보정한다.
 pub(crate) fn map_pua_bullet_char(ch: char) -> char {
     let code = ch as u32;
+    if code == 0xF03C5 {
+        return '\u{25A1}'; // □ White square (확장 PUA에서 관측된 체크박스)
+    }
     if !(0xF020..=0xF0FF).contains(&code) {
         return ch;
     }

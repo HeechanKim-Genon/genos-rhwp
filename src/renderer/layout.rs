@@ -193,6 +193,11 @@ fn force_para_end_on_last_run(col_node: &mut RenderNode) {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct FloatExclusion {
+    rect: LayoutRect,
+}
+
 pub struct LayoutEngine {
     /// DPI
     dpi: f64,
@@ -240,6 +245,8 @@ pub struct LayoutEngine {
     /// 현재 페이지 본문 영역 (표 HorzRelTo::Page / VertRelTo::Page 위치 계산용)
     /// (x, y, width, height). 미설정 시 (0, 0, 0, 0) — 호출부에서 col_area로 폴백.
     current_body_area: std::cell::Cell<(f64, f64, f64, f64)>,
+    /// 현재 페이지 본문에 활성인 플로팅 개체 exclusion 영역
+    float_exclusions: std::cell::RefCell<Vec<FloatExclusion>>,
 }
 
 mod text_measurement;
@@ -282,6 +289,7 @@ impl LayoutEngine {
             show_control_codes: std::cell::Cell::new(false),
             current_paper_width: std::cell::Cell::new(0.0),
             current_body_area: std::cell::Cell::new((0.0, 0.0, 0.0, 0.0)),
+            float_exclusions: std::cell::RefCell::new(Vec::new()),
         }
     }
 
@@ -370,6 +378,49 @@ impl LayoutEngine {
         self.auto_counter.borrow_mut().reset();
     }
 
+    pub(crate) fn register_float_exclusion(&self, rect: LayoutRect, body_area: &LayoutRect, col_area: &LayoutRect) {
+        let rect_right = rect.x + rect.width;
+        let rect_bottom = rect.y + rect.height;
+        let body_right = body_area.x + body_area.width;
+        let body_bottom = body_area.y + body_area.height;
+        let col_right = col_area.x + col_area.width;
+        if rect.width <= 1.0 || rect.height <= 1.0 {
+            return;
+        }
+        if rect_right <= body_area.x || rect.x >= body_right || rect_bottom <= body_area.y || rect.y >= body_bottom {
+            return;
+        }
+        if rect_right <= col_area.x || rect.x >= col_right {
+            return;
+        }
+        self.float_exclusions.borrow_mut().push(FloatExclusion { rect });
+    }
+
+    pub(crate) fn float_exclusion_pads(&self, col_area: &LayoutRect, line_y: f64, line_height: f64) -> (f64, f64) {
+        let mut left_pad = 0.0f64;
+        let mut right_pad = 0.0f64;
+        let line_bottom = line_y + line_height;
+        let col_right = col_area.x + col_area.width;
+
+        for ex in self.float_exclusions.borrow().iter() {
+            let rect = ex.rect;
+            let rect_bottom = rect.y + rect.height;
+            if rect_bottom <= line_y || rect.y >= line_bottom {
+                continue;
+            }
+            if rect.x <= col_area.x + col_area.width / 2.0 {
+                left_pad = left_pad.max((rect.x + rect.width - col_area.x).clamp(0.0, col_area.width));
+            } else {
+                right_pad = right_pad.max((col_right - rect.x).clamp(0.0, col_area.width));
+            }
+        }
+
+        if left_pad + right_pad > col_area.width {
+            right_pad = (col_area.width - left_pad).max(0.0);
+        }
+        (left_pad, right_pad)
+    }
+
     /// 페이지 분할 결과와 원본 문단으로부터 렌더 트리를 생성한다.
     ///
     /// - `paragraphs`: 본문 구역의 문단 슬라이스
@@ -392,6 +443,7 @@ impl LayoutEngine {
         wrap_around_paras: &[super::pagination::WrapAroundPara],
     ) -> PageRenderTree {
         let layout = &page_content.layout;
+        self.float_exclusions.borrow_mut().clear();
         let mut tree = PageRenderTree::new(
             page_content.page_index,
             layout.page_width,
@@ -2872,6 +2924,42 @@ impl LayoutEngine {
                                 width: col_area.width,
                                 height: col_area.height - (pic_y - col_area.y),
                             };
+                            if !matches!(pic.common.text_wrap, crate::model::shape::TextWrap::TopAndBottom) {
+                                let pic_width = hwpunit_to_px(pic.common.width as i32, self.dpi);
+                                let pic_height = hwpunit_to_px(pic.common.height as i32, self.dpi);
+                                let page_rect = LayoutRect {
+                                    x: 0.0,
+                                    y: 0.0,
+                                    width: layout.page_width,
+                                    height: layout.page_height,
+                                };
+                                let (pic_x_abs, pic_y_abs) = self.compute_object_position(
+                                    &pic.common,
+                                    pic_width,
+                                    pic_height,
+                                    &pic_container,
+                                    col_area,
+                                    &layout.body_area,
+                                    &page_rect,
+                                    pic_y,
+                                    alignment,
+                                );
+                                let margin = &pic.common.margin;
+                                self.register_float_exclusion(
+                                    LayoutRect {
+                                        x: pic_x_abs - hwpunit_to_px(margin.left as i32, self.dpi),
+                                        y: pic_y_abs - hwpunit_to_px(margin.top as i32, self.dpi),
+                                        width: pic_width
+                                            + hwpunit_to_px(margin.left as i32, self.dpi)
+                                            + hwpunit_to_px(margin.right as i32, self.dpi),
+                                        height: pic_height
+                                            + hwpunit_to_px(margin.top as i32, self.dpi)
+                                            + hwpunit_to_px(margin.bottom as i32, self.dpi),
+                                    },
+                                    &layout.body_area,
+                                    col_area,
+                                );
+                            }
                             result_y = self.layout_body_picture(
                                 tree, col_node, pic,
                                 &pic_container, col_area, &layout.body_area,
