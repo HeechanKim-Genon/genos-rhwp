@@ -1293,6 +1293,7 @@ fn read_plain_text(reader: &mut Reader<&[u8]>, end_name: &[u8]) -> Result<String
         match reader.read_event_into(&mut buf) {
             Ok(Event::Text(t)) => out.push_str(&String::from_utf8_lossy(t.as_ref())),
             Ok(Event::CData(t)) => out.push_str(&String::from_utf8_lossy(t.as_ref())),
+            Ok(Event::GeneralRef(r)) => append_xml_ref(&r, &mut out),
             Ok(Event::End(ref e)) if eq_name(local_name(e.name().as_ref()), end_name) => break,
             Ok(Event::Eof) => break,
             Err(e) => return Err(HwpmlError::XmlError(format!("text read: {}", e))),
@@ -1301,6 +1302,28 @@ fn read_plain_text(reader: &mut Reader<&[u8]>, end_name: &[u8]) -> Result<String
         buf.clear();
     }
     Ok(out)
+}
+
+fn append_xml_ref(r: &quick_xml::events::BytesRef, out: &mut String) {
+    if let Ok(Some(ch)) = r.resolve_char_ref() {
+        out.push(ch);
+        return;
+    }
+    if let Ok(name) = r.decode() {
+        match name.as_ref() {
+            "lt" => out.push('<'),
+            "gt" => out.push('>'),
+            "amp" => out.push('&'),
+            "quot" => out.push('"'),
+            "apos" => out.push('\''),
+            "nbsp" => out.push('\u{00A0}'),
+            _ => {
+                out.push('&');
+                out.push_str(&name);
+                out.push(';');
+            }
+        }
+    }
 }
 
 fn skip_element(reader: &mut Reader<&[u8]>, end_name: &[u8]) -> Result<(), HwpmlError> {
