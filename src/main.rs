@@ -1,5 +1,7 @@
 use std::env;
 use std::fs;
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
 use std::path::Path;
 
 fn main() {
@@ -10,6 +12,7 @@ fn main() {
         Some("--version") | Some("-V") => println!("rhwp v{}", rhwp::version()),
         Some("export-svg") => export_svg(&args[2..]),
         Some("export-pdf") => export_pdf(&args[2..]),
+        Some("serve-pdf") => serve_pdf_api(&args[2..]),
         Some("export-text") => export_text(&args[2..]),
         Some("export-markdown") => export_markdown(&args[2..]),
         Some("info") => show_info(&args[2..]),
@@ -58,6 +61,10 @@ fn print_help() {
     println!();
     println!("      -o, --output <폴더>     출력 폴더 (기본: output/)");
     println!("      -p, --page <번호>       특정 페이지만 내보내기 (0부터 시작)");
+    println!();
+    println!("  serve-pdf [--host <호스트>] [--port <포트>]");
+    println!("      HWP→PDF 변환 HTTP API 서버 실행");
+    println!("      POST /api/convert/hwp-to-pdf 로 application/octet-stream HWP 바이트 전송");
     println!();
     println!("  export-markdown <파일.hwp> [옵션]");
     println!("      페이지별 텍스트를 Markdown(.md)으로 내보내기");
@@ -225,7 +232,10 @@ fn export_svg(args: &[String]) {
     let output_path = Path::new(&output_dir);
     if !output_path.exists() {
         if let Err(e) = fs::create_dir_all(output_path) {
-            eprintln!("오류: 출력 폴더를 생성할 수 없습니다 - {}: {}", output_dir, e);
+            eprintln!(
+                "오류: 출력 폴더를 생성할 수 없습니다 - {}: {}",
+                output_dir, e
+            );
             return;
         }
     }
@@ -234,7 +244,10 @@ fn export_svg(args: &[String]) {
     let pages: Vec<u32> = match target_page {
         Some(p) => {
             if p >= page_count {
-                eprintln!("오류: 페이지 번호가 범위를 벗어났습니다 (0~{})", page_count - 1);
+                eprintln!(
+                    "오류: 페이지 번호가 범위를 벗어났습니다 (0~{})",
+                    page_count - 1
+                );
                 return;
             }
             vec![p]
@@ -278,7 +291,11 @@ fn export_svg(args: &[String]) {
         }
     }
 
-    println!("내보내기 완료: {}개 SVG 파일 → {}/", pages.len(), output_dir);
+    println!(
+        "내보내기 완료: {}개 SVG 파일 → {}/",
+        pages.len(),
+        output_dir
+    );
 }
 
 /// SVG에 1mm 격자 오버레이를 삽입한다.
@@ -288,7 +305,7 @@ fn insert_grid_overlay(svg: &str) -> String {
     let (width, height) = extract_svg_dimensions(svg);
     // 1mm = 96dpi 기준 3.7795px
     let grid_px = 96.0 * 25.4 / 96.0; // 1mm in px at 96dpi... 실제로 SVG 좌표는 px
-    // 96dpi: 1inch = 25.4mm, 1px = 25.4/96 = 0.2646mm, 1mm = 96/25.4 = 3.7795px
+                                      // 96dpi: 1inch = 25.4mm, 1px = 25.4/96 = 0.2646mm, 1mm = 96/25.4 = 3.7795px
     let grid_size = 96.0 / 25.4; // 3.7795 px per mm
 
     let g = format!("{:.4}", grid_size);
@@ -307,9 +324,7 @@ fn insert_grid_overlay(svg: &str) -> String {
         let defs_part = format!(
             "<defs><pattern id=\"rhwp-grid\" width=\"{g}\" height=\"{g}\" patternUnits=\"userSpaceOnUse\"><path d=\"M {g} 0 L 0 0 0 {g}\" fill=\"none\" stroke=\"#CCCCCC\" stroke-width=\"0.3\"/></pattern></defs>"
         );
-        let grid_rect = format!(
-            "\n<rect width=\"{w}\" height=\"{h}\" fill=\"url(#rhwp-grid)\"/>"
-        );
+        let grid_rect = format!("\n<rect width=\"{w}\" height=\"{h}\" fill=\"url(#rhwp-grid)\"/>");
         // defs를 <svg> 태그 직후에 삽입
         let mut result = svg.to_string();
         // 배경 rect 뒤에 격자 rect 삽입
@@ -361,6 +376,36 @@ fn extract_attr_f64(svg: &str, attr: &str) -> Option<f64> {
     None
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+fn hwp_to_pdf_bytes(data: &[u8], target_page: Option<u32>) -> Result<(Vec<u8>, usize), String> {
+    let doc = rhwp::wasm_api::HwpDocument::from_bytes(data)
+        .map_err(|e| format!("HWP 파싱 실패: {}", e))?;
+
+    let page_count = doc.page_count();
+    let pages: Vec<u32> = match target_page {
+        Some(p) => {
+            if p >= page_count {
+                return Err(format!(
+                    "페이지 번호가 범위를 벗어났습니다 (0~{})",
+                    page_count.saturating_sub(1)
+                ));
+            }
+            vec![p]
+        }
+        None => (0..page_count).collect(),
+    };
+
+    let mut svg_pages = Vec::new();
+    for page_num in &pages {
+        let svg = doc
+            .render_page_svg(*page_num)
+            .map_err(|e| format!("페이지 {} 렌더링 실패: {:?}", page_num, e))?;
+        svg_pages.push(svg);
+    }
+
+    rhwp::renderer::pdf::svgs_to_pdf(&svg_pages).map(|bytes| (bytes, svg_pages.len()))
+}
+
 fn export_pdf(args: &[String]) {
     if args.is_empty() {
         eprintln!("오류: HWP 파일 경로를 지정해주세요.");
@@ -399,7 +444,9 @@ fn export_pdf(args: &[String]) {
                     return;
                 }
             }
-            _ => { i += 1; }
+            _ => {
+                i += 1;
+            }
         }
     }
 
@@ -420,16 +467,7 @@ fn export_pdf(args: &[String]) {
         }
     };
 
-    let mut doc = match rhwp::wasm_api::HwpDocument::from_bytes(&data) {
-        Ok(d) => d,
-        Err(e) => {
-            eprintln!("오류: HWP 파싱 실패 - {}", e);
-            return;
-        }
-    };
-
-    let page_count = doc.page_count();
-    println!("문서 로드 완료: {} ({}페이지)", file_path, page_count);
+    println!("문서 로드 완료: {}", file_path);
 
     // 출력 디렉토리 생성
     if let Some(parent) = Path::new(&output_file).parent() {
@@ -438,45 +476,276 @@ fn export_pdf(args: &[String]) {
         }
     }
 
-    // 페이지 범위 결정
-    let pages: Vec<u32> = match target_page {
-        Some(p) => {
-            if p >= page_count {
-                eprintln!("오류: 페이지 번호가 범위를 벗어났습니다 (0~{})", page_count - 1);
-                return;
-            }
-            vec![p]
-        }
-        None => (0..page_count).collect(),
-    };
-
-    // SVG 렌더링 → PDF 변환
-    let mut svg_pages: Vec<String> = Vec::new();
-    for page_num in &pages {
-        match doc.render_page_svg(*page_num) {
-            Ok(svg) => svg_pages.push(svg),
-            Err(e) => {
-                eprintln!("오류: 페이지 {} 렌더링 실패 - {:?}", page_num, e);
-                return;
-            }
-        }
-    }
-
     #[cfg(not(target_arch = "wasm32"))]
     {
-        use rhwp::renderer::pdf;
-        match pdf::svgs_to_pdf(&svg_pages) {
-            Ok(pdf_bytes) => {
-                match fs::write(&output_file, &pdf_bytes) {
-                    Ok(_) => println!("  → {} ({}KB, {}페이지)", output_file, pdf_bytes.len() / 1024, svg_pages.len()),
-                    Err(e) => eprintln!("오류: PDF 저장 실패 - {}", e),
-                }
-            }
+        match hwp_to_pdf_bytes(&data, target_page) {
+            Ok((pdf_bytes, converted_pages)) => match fs::write(&output_file, &pdf_bytes) {
+                Ok(_) => println!(
+                    "  → {} ({}KB, {}페이지)",
+                    output_file,
+                    pdf_bytes.len() / 1024,
+                    converted_pages
+                ),
+                Err(e) => eprintln!("오류: PDF 저장 실패 - {}", e),
+            },
             Err(e) => eprintln!("오류: PDF 변환 실패 - {}", e),
         }
     }
 
     println!("PDF 내보내기 완료");
+}
+
+fn serve_pdf_api(args: &[String]) {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = args;
+        eprintln!("오류: PDF API 서버는 네이티브 빌드에서만 사용할 수 있습니다.");
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let mut host = "127.0.0.1".to_string();
+        let mut port = "7878".to_string();
+
+        let mut i = 0;
+        while i < args.len() {
+            match args[i].as_str() {
+                "--host" => {
+                    if i + 1 < args.len() {
+                        host = args[i + 1].clone();
+                        i += 2;
+                    } else {
+                        eprintln!("오류: --host 뒤에 호스트가 필요합니다.");
+                        return;
+                    }
+                }
+                "--port" | "-p" => {
+                    if i + 1 < args.len() {
+                        port = args[i + 1].clone();
+                        i += 2;
+                    } else {
+                        eprintln!("오류: --port 뒤에 포트가 필요합니다.");
+                        return;
+                    }
+                }
+                _ => {
+                    eprintln!("오류: 알 수 없는 옵션 {}", args[i]);
+                    eprintln!("사용법: rhwp serve-pdf [--host 127.0.0.1] [--port 7878]");
+                    return;
+                }
+            }
+        }
+
+        let addr = format!("{}:{}", host, port);
+        let listener = match TcpListener::bind(&addr) {
+            Ok(listener) => listener,
+            Err(e) => {
+                eprintln!("오류: {} 바인딩 실패 - {}", addr, e);
+                return;
+            }
+        };
+
+        println!("PDF 변환 API 서버 시작: http://{}", addr);
+        println!("POST /api/convert/hwp-to-pdf  Content-Type: application/octet-stream");
+
+        for stream in listener.incoming() {
+            match stream {
+                Ok(stream) => {
+                    std::thread::spawn(move || {
+                        if let Err(e) = handle_pdf_api_connection(stream) {
+                            eprintln!("요청 처리 실패: {}", e);
+                        }
+                    });
+                }
+                Err(e) => eprintln!("연결 실패: {}", e),
+            }
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn handle_pdf_api_connection(mut stream: TcpStream) -> Result<(), String> {
+    let mut buffer = Vec::new();
+    let mut chunk = [0u8; 8192];
+    let header_end;
+
+    loop {
+        let n = stream.read(&mut chunk).map_err(|e| e.to_string())?;
+        if n == 0 {
+            return Err("빈 요청입니다".to_string());
+        }
+        buffer.extend_from_slice(&chunk[..n]);
+        if let Some(pos) = find_header_end(&buffer) {
+            header_end = pos;
+            break;
+        }
+        if buffer.len() > 1024 * 1024 {
+            write_response(
+                &mut stream,
+                "431 Request Header Fields Too Large",
+                "text/plain; charset=utf-8",
+                b"request headers too large",
+            )?;
+            return Ok(());
+        }
+    }
+
+    let header_bytes = &buffer[..header_end];
+    let headers = String::from_utf8_lossy(header_bytes);
+    let mut lines = headers.lines();
+    let request_line = lines.next().unwrap_or_default();
+    let mut parts = request_line.split_whitespace();
+    let method = parts.next().unwrap_or_default();
+    let target = parts.next().unwrap_or_default();
+
+    if method != "POST" {
+        write_response(
+            &mut stream,
+            "405 Method Not Allowed",
+            "text/plain; charset=utf-8",
+            b"method not allowed",
+        )?;
+        return Ok(());
+    }
+
+    let (path, query) = split_target(target);
+    if path != "/api/convert/hwp-to-pdf" {
+        write_response(
+            &mut stream,
+            "404 Not Found",
+            "text/plain; charset=utf-8",
+            b"not found",
+        )?;
+        return Ok(());
+    }
+
+    let content_length = match content_length(&headers) {
+        Some(len) => len,
+        None => {
+            write_response(
+                &mut stream,
+                "411 Length Required",
+                "text/plain; charset=utf-8",
+                b"content-length required",
+            )?;
+            return Ok(());
+        }
+    };
+
+    let target_page = match query_page(query) {
+        Ok(page) => page,
+        Err(e) => {
+            write_response(
+                &mut stream,
+                "400 Bad Request",
+                "text/plain; charset=utf-8",
+                e.as_bytes(),
+            )?;
+            return Ok(());
+        }
+    };
+
+    let body_start = header_end + 4;
+    let mut body = buffer[body_start..].to_vec();
+    while body.len() < content_length {
+        let n = stream.read(&mut chunk).map_err(|e| e.to_string())?;
+        if n == 0 {
+            break;
+        }
+        body.extend_from_slice(&chunk[..n]);
+    }
+    body.truncate(content_length);
+
+    if body.len() != content_length {
+        write_response(
+            &mut stream,
+            "400 Bad Request",
+            "text/plain; charset=utf-8",
+            b"incomplete request body",
+        )?;
+        return Ok(());
+    }
+
+    match hwp_to_pdf_bytes(&body, target_page) {
+        Ok((pdf_bytes, _page_count)) => {
+            write_response(&mut stream, "200 OK", "application/pdf", &pdf_bytes)?;
+        }
+        Err(e) => {
+            write_response(
+                &mut stream,
+                "422 Unprocessable Entity",
+                "text/plain; charset=utf-8",
+                e.as_bytes(),
+            )?;
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn find_header_end(bytes: &[u8]) -> Option<usize> {
+    bytes.windows(4).position(|w| w == b"\r\n\r\n")
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn split_target(target: &str) -> (&str, Option<&str>) {
+    match target.split_once('?') {
+        Some((path, query)) => (path, Some(query)),
+        None => (target, None),
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn content_length(headers: &str) -> Option<usize> {
+    headers.lines().find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        if name.eq_ignore_ascii_case("content-length") {
+            value.trim().parse().ok()
+        } else {
+            None
+        }
+    })
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn query_page(query: Option<&str>) -> Result<Option<u32>, String> {
+    let Some(query) = query else {
+        return Ok(None);
+    };
+
+    for pair in query.split('&') {
+        let Some((key, value)) = pair.split_once('=') else {
+            continue;
+        };
+        if key == "page" {
+            return value
+                .parse::<u32>()
+                .map(Some)
+                .map_err(|_| "page query must be an unsigned integer".to_string());
+        }
+    }
+    Ok(None)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn write_response(
+    stream: &mut TcpStream,
+    status: &str,
+    content_type: &str,
+    body: &[u8],
+) -> Result<(), String> {
+    let header = format!(
+        "HTTP/1.1 {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        status,
+        content_type,
+        body.len()
+    );
+    stream
+        .write_all(header.as_bytes())
+        .map_err(|e| e.to_string())?;
+    stream.write_all(body).map_err(|e| e.to_string())?;
+    stream.flush().map_err(|e| e.to_string())
 }
 
 fn export_text(args: &[String]) {
@@ -550,7 +819,10 @@ fn export_text(args: &[String]) {
     let output_path = Path::new(&output_dir);
     if !output_path.exists() {
         if let Err(e) = fs::create_dir_all(output_path) {
-            eprintln!("오류: 출력 폴더를 생성할 수 없습니다 - {}: {}", output_dir, e);
+            eprintln!(
+                "오류: 출력 폴더를 생성할 수 없습니다 - {}: {}",
+                output_dir, e
+            );
             return;
         }
     }
@@ -558,7 +830,10 @@ fn export_text(args: &[String]) {
     let pages: Vec<u32> = match target_page {
         Some(p) => {
             if p >= page_count {
-                eprintln!("오류: 페이지 번호가 범위를 벗어났습니다 (0~{})", page_count - 1);
+                eprintln!(
+                    "오류: 페이지 번호가 범위를 벗어났습니다 (0~{})",
+                    page_count - 1
+                );
                 return;
             }
             vec![p]
@@ -596,7 +871,11 @@ fn export_text(args: &[String]) {
         }
     }
 
-    println!("텍스트 내보내기 완료: {}개 TXT 파일 → {}/", pages.len(), output_dir);
+    println!(
+        "텍스트 내보내기 완료: {}개 TXT 파일 → {}/",
+        pages.len(),
+        output_dir
+    );
 }
 
 fn export_markdown(args: &[String]) {
@@ -670,7 +949,10 @@ fn export_markdown(args: &[String]) {
     let output_path = Path::new(&output_dir);
     if !output_path.exists() {
         if let Err(e) = fs::create_dir_all(output_path) {
-            eprintln!("오류: 출력 폴더를 생성할 수 없습니다 - {}: {}", output_dir, e);
+            eprintln!(
+                "오류: 출력 폴더를 생성할 수 없습니다 - {}: {}",
+                output_dir, e
+            );
             return;
         }
     }
@@ -678,7 +960,10 @@ fn export_markdown(args: &[String]) {
     let pages: Vec<u32> = match target_page {
         Some(p) => {
             if p >= page_count {
-                eprintln!("오류: 페이지 번호가 범위를 벗어났습니다 (0~{})", page_count - 1);
+                eprintln!(
+                    "오류: 페이지 번호가 범위를 벗어났습니다 (0~{})",
+                    page_count - 1
+                );
                 return;
             }
             vec![p]
@@ -734,7 +1019,8 @@ fn export_markdown(args: &[String]) {
                                     markdown = markdown.replace(&token, "");
                                     continue;
                                 }
-                                let fb_mime = match doc.get_bin_data_image_mime_native(*bin_data_id) {
+                                let fb_mime = match doc.get_bin_data_image_mime_native(*bin_data_id)
+                                {
                                     Ok(m) => m,
                                     Err(e) => {
                                         eprintln!(
@@ -745,7 +1031,8 @@ fn export_markdown(args: &[String]) {
                                         continue;
                                     }
                                 };
-                                let fb_data = match doc.get_bin_data_image_data_native(*bin_data_id) {
+                                let fb_data = match doc.get_bin_data_image_data_native(*bin_data_id)
+                                {
                                     Ok(d) => d,
                                     Err(e) => {
                                         eprintln!(
@@ -816,16 +1103,17 @@ fn export_markdown(args: &[String]) {
                     let image_path = assets_dir_path.join(&image_filename);
 
                     if let Err(e) = fs::write(&image_path, &image_data) {
-                        eprintln!(
-                            "경고: 이미지 저장 실패 - {}: {}",
-                            image_path.display(),
-                            e
-                        );
+                        eprintln!("경고: 이미지 저장 실패 - {}: {}", image_path.display(), e);
                         markdown = markdown.replace(&token, "");
                         continue;
                     }
 
-                    let image_link = format!("![image {}]({}/{})", img_idx + 1, assets_dir_name, image_filename);
+                    let image_link = format!(
+                        "![image {}]({}/{})",
+                        img_idx + 1,
+                        assets_dir_name,
+                        image_filename
+                    );
                     markdown = markdown.replace(&token, &image_link);
                     written_image_count += 1;
                 }
@@ -860,7 +1148,11 @@ fn export_markdown(args: &[String]) {
             output_dir
         );
     } else {
-        println!("Markdown 내보내기 완료: {}개 MD 파일 → {}/", pages.len(), output_dir);
+        println!(
+            "Markdown 내보내기 완료: {}개 MD 파일 → {}/",
+            pages.len(),
+            output_dir
+        );
     }
 }
 
@@ -903,25 +1195,56 @@ fn show_info(args: &[String]) {
         document.header.version.build,
         document.header.version.revision,
     );
-    println!("압축: {}", if document.header.compressed { "예" } else { "아니오" });
-    println!("암호화: {}", if document.header.encrypted { "예" } else { "아니오" });
-    println!("배포용: {}", if document.header.distribution { "예" } else { "아니오" });
+    println!(
+        "압축: {}",
+        if document.header.compressed {
+            "예"
+        } else {
+            "아니오"
+        }
+    );
+    println!(
+        "암호화: {}",
+        if document.header.encrypted {
+            "예"
+        } else {
+            "아니오"
+        }
+    );
+    println!(
+        "배포용: {}",
+        if document.header.distribution {
+            "예"
+        } else {
+            "아니오"
+        }
+    );
     println!("구역 수: {}", document.sections.len());
     println!("페이지 수: {}", doc.page_count());
 
     // 용지 정보
     for (sec_idx, section) in document.sections.iter().enumerate() {
         let page_def = &section.section_def.page_def;
-        let orientation = if page_def.landscape { "가로" } else { "세로" };
-        println!("구역{} 용지: {}×{} HWPUNIT, 방향={} (여백: 좌{} 우{} 상{} 하{})",
+        let orientation = if page_def.landscape {
+            "가로"
+        } else {
+            "세로"
+        };
+        println!(
+            "구역{} 용지: {}×{} HWPUNIT, 방향={} (여백: 좌{} 우{} 상{} 하{})",
             sec_idx,
-            page_def.width, page_def.height, orientation,
-            page_def.margin_left, page_def.margin_right,
-            page_def.margin_top, page_def.margin_bottom,
+            page_def.width,
+            page_def.height,
+            orientation,
+            page_def.margin_left,
+            page_def.margin_right,
+            page_def.margin_top,
+            page_def.margin_bottom,
         );
-        println!("  머리말여백={} 꼬리말여백={} 제본여백={}",
-            page_def.margin_header, page_def.margin_footer,
-            page_def.margin_gutter);
+        println!(
+            "  머리말여백={} 꼬리말여백={} 제본여백={}",
+            page_def.margin_header, page_def.margin_footer, page_def.margin_gutter
+        );
         if section.section_def.hide_empty_line {
             println!("  빈 줄 감추기: 활성");
         }
@@ -931,7 +1254,11 @@ fn show_info(args: &[String]) {
     let lang_names = ["한글", "영어", "한자", "일어", "기타", "기호", "사용자"];
     for (i, fonts) in document.doc_info.font_faces.iter().enumerate() {
         if !fonts.is_empty() {
-            let name = if i < lang_names.len() { lang_names[i] } else { "기타" };
+            let name = if i < lang_names.len() {
+                lang_names[i]
+            } else {
+                "기타"
+            };
             let font_names: Vec<&str> = fonts.iter().map(|f| f.name.as_str()).collect();
             println!("폰트({}): {}", name, font_names.join(", "));
         }
@@ -939,7 +1266,12 @@ fn show_info(args: &[String]) {
 
     // 스타일 목록
     if !document.doc_info.styles.is_empty() {
-        let style_names: Vec<&str> = document.doc_info.styles.iter().map(|s| s.local_name.as_str()).collect();
+        let style_names: Vec<&str> = document
+            .doc_info
+            .styles
+            .iter()
+            .map(|s| s.local_name.as_str())
+            .collect();
         println!("스타일: {}", style_names.join(", "));
     }
 
@@ -958,12 +1290,16 @@ fn show_info(args: &[String]) {
             };
             let ext = bd.extension.as_deref().unwrap_or("?");
             // 로드된 데이터 크기 확인
-            let loaded_size = document.bin_data_content
+            let loaded_size = document
+                .bin_data_content
                 .iter()
                 .find(|c| c.id == bd.storage_id)
                 .map(|c| c.data.len())
                 .unwrap_or(0);
-            println!("  [{}] {} (ID: {}, ext: {}, loaded: {} bytes)", idx, type_str, bd.storage_id, ext, loaded_size);
+            println!(
+                "  [{}] {} (ID: {}, ext: {}, loaded: {} bytes)",
+                idx, type_str, bd.storage_id, ext, loaded_size
+            );
         }
     }
 
@@ -978,9 +1314,11 @@ fn show_info(args: &[String]) {
                 *picture_idx += 1;
                 println!(
                     "그림{} [{}]: bin_data_id={}, size={}×{}",
-                    *picture_idx, location,
+                    *picture_idx,
+                    location,
                     pic.image_attr.bin_data_id,
-                    pic.common.width, pic.common.height,
+                    pic.common.width,
+                    pic.common.height,
                 );
             }
             Control::Table(table) => {
@@ -1012,9 +1350,14 @@ fn show_info(args: &[String]) {
                         };
                         println!(
                             "표{} [{}]: {}행×{}열, 셀 {}개, 쪽나눔={} (attr=0x{:08x}), 제목반복={}",
-                            table_idx, location,
-                            table.row_count, table.col_count, table.cells.len(),
-                            page_break_str, table.raw_table_record_attr, table.repeat_header,
+                            table_idx,
+                            location,
+                            table.row_count,
+                            table.col_count,
+                            table.cells.len(),
+                            page_break_str,
+                            table.raw_table_record_attr,
+                            table.repeat_header,
                         );
                         count_pictures(ctrl, &mut picture_idx, &location);
                     }
@@ -1043,8 +1386,10 @@ fn show_info(args: &[String]) {
                         };
                         println!(
                             "도형 [{}]: {}, size={}×{}, treat_as_char={}{}",
-                            location, shape_type,
-                            common.width, common.height,
+                            location,
+                            shape_type,
+                            common.width,
+                            common.height,
                             common.treat_as_char,
                             border_info,
                         );
@@ -1098,13 +1443,17 @@ fn dump_pages(args: &[String]) {
                 if i + 1 < args.len() {
                     target_page = args[i + 1].parse().ok();
                     i += 2;
-                } else { i += 1; }
+                } else {
+                    i += 1;
+                }
             }
             "--respect-vpos-reset" => {
                 respect_vpos_reset = true;
                 i += 1;
             }
-            _ => { i += 1; }
+            _ => {
+                i += 1;
+            }
         }
     }
 
@@ -1150,15 +1499,21 @@ fn dump_controls(args: &[String]) {
                 if i + 1 < args.len() {
                     filter_section = args[i + 1].parse().ok();
                     i += 2;
-                } else { i += 1; }
+                } else {
+                    i += 1;
+                }
             }
             "--para" | "-p" => {
                 if i + 1 < args.len() {
                     filter_para = args[i + 1].parse().ok();
                     i += 2;
-                } else { i += 1; }
+                } else {
+                    i += 1;
+                }
             }
-            _ => { i += 1; }
+            _ => {
+                i += 1;
+            }
         }
     }
 
@@ -1184,16 +1539,41 @@ fn dump_controls(args: &[String]) {
     if filter_section.is_none() && filter_para.is_none() {
         for (i, bf) in document.doc_info.border_fills.iter().enumerate() {
             let fill = &bf.fill;
-            let solid_info = fill.solid.as_ref().map(|s| format!("bg=#{:06X} pat_type={} pat_color=#{:06X}", s.background_color, s.pattern_type, s.pattern_color)).unwrap_or_default();
-            let grad_info = if fill.gradient.is_some() { " gradient" } else { "" };
-            let img_info = fill.image.as_ref().map(|img| format!(" image(bin_id={}, mode={:?})", img.bin_data_id, img.fill_mode)).unwrap_or_default();
-            println!("  border_fill[{}] fill_type={:?} {}{}{}", i, fill.fill_type, solid_info, grad_info, img_info);
+            let solid_info = fill
+                .solid
+                .as_ref()
+                .map(|s| {
+                    format!(
+                        "bg=#{:06X} pat_type={} pat_color=#{:06X}",
+                        s.background_color, s.pattern_type, s.pattern_color
+                    )
+                })
+                .unwrap_or_default();
+            let grad_info = if fill.gradient.is_some() {
+                " gradient"
+            } else {
+                ""
+            };
+            let img_info = fill
+                .image
+                .as_ref()
+                .map(|img| {
+                    format!(
+                        " image(bin_id={}, mode={:?})",
+                        img.bin_data_id, img.fill_mode
+                    )
+                })
+                .unwrap_or_default();
+            println!(
+                "  border_fill[{}] fill_type={:?} {}{}{}",
+                i, fill.fill_type, solid_info, grad_info, img_info
+            );
         }
     }
 
     use rhwp::model::control::Control;
-    use rhwp::model::shape::{ShapeObject, VertRelTo, HorzRelTo, TextWrap};
     use rhwp::model::paragraph::ColumnBreakType;
+    use rhwp::model::shape::{HorzRelTo, ShapeObject, TextWrap, VertRelTo};
 
     let vert_str = |v: &VertRelTo| -> &str {
         match v {
@@ -1232,15 +1612,33 @@ fn dump_controls(args: &[String]) {
 
     // 도형 공통 속성 출력 헬퍼
     let dump_common = |c: &rhwp::model::shape::CommonObjAttr, indent: &str| {
-        println!("{}  크기: {:.1}mm × {:.1}mm ({}×{} HU)",
-            indent, hu_to_mm(c.width), hu_to_mm(c.height), c.width, c.height);
-        println!("{}  위치: 가로={} 오프셋={:.1}mm({}) 정렬={:?}, 세로={} 오프셋={:.1}mm({}) 정렬={:?}",
-            indent, horz_str(&c.horz_rel_to),
-            hu_to_mm(c.horizontal_offset), c.horizontal_offset, c.horz_align,
+        println!(
+            "{}  크기: {:.1}mm × {:.1}mm ({}×{} HU)",
+            indent,
+            hu_to_mm(c.width),
+            hu_to_mm(c.height),
+            c.width,
+            c.height
+        );
+        println!(
+            "{}  위치: 가로={} 오프셋={:.1}mm({}) 정렬={:?}, 세로={} 오프셋={:.1}mm({}) 정렬={:?}",
+            indent,
+            horz_str(&c.horz_rel_to),
+            hu_to_mm(c.horizontal_offset),
+            c.horizontal_offset,
+            c.horz_align,
             vert_str(&c.vert_rel_to),
-            hu_to_mm(c.vertical_offset), c.vertical_offset, c.vert_align);
-        println!("{}  배치: {}, 글자처럼={}, z={}",
-            indent, wrap_str(&c.text_wrap), c.treat_as_char, c.z_order);
+            hu_to_mm(c.vertical_offset),
+            c.vertical_offset,
+            c.vert_align
+        );
+        println!(
+            "{}  배치: {}, 글자처럼={}, z={}",
+            indent,
+            wrap_str(&c.text_wrap),
+            c.treat_as_char,
+            c.z_order
+        );
     };
 
     // 도형 요소 속성 출력 헬퍼
@@ -1255,32 +1653,58 @@ fn dump_controls(args: &[String]) {
             sa.offset_x, sa.offset_y,
             hu_to_mm(eff_w), hu_to_mm(eff_h));
         if sa.horz_flip || sa.vert_flip || sa.rotation_angle != 0 {
-            println!("{}  변환: 뒤집기=({},{}), 회전={}",
-                indent, sa.horz_flip, sa.vert_flip, sa.rotation_angle);
+            println!(
+                "{}  변환: 뒤집기=({},{}), 회전={}",
+                indent, sa.horz_flip, sa.vert_flip, sa.rotation_angle
+            );
         }
     };
 
     // 재귀적 도형 덤프
     fn dump_shape(
-        shape: &ShapeObject, indent: &str,
+        shape: &ShapeObject,
+        indent: &str,
         dump_common_fn: &dyn Fn(&rhwp::model::shape::CommonObjAttr, &str),
         dump_sa_fn: &dyn Fn(&rhwp::model::shape::ShapeComponentAttr, &str),
     ) {
         match shape {
             ShapeObject::Line(s) => {
-                println!("{}[직선] start=({},{}) end=({},{})",
-                    indent, s.start.x, s.start.y, s.end.x, s.end.y);
-                println!("{}  선: color={:#010x}, width={}, style={:#06x}",
-                    indent, s.drawing.border_line.color, s.drawing.border_line.width, s.drawing.border_line.attr);
+                println!(
+                    "{}[직선] start=({},{}) end=({},{})",
+                    indent, s.start.x, s.start.y, s.end.x, s.end.y
+                );
+                println!(
+                    "{}  선: color={:#010x}, width={}, style={:#06x}",
+                    indent,
+                    s.drawing.border_line.color,
+                    s.drawing.border_line.width,
+                    s.drawing.border_line.attr
+                );
                 dump_common_fn(&s.common, indent);
                 dump_sa_fn(&s.drawing.shape_attr, indent);
             }
             ShapeObject::Rectangle(s) => {
                 println!("{}[사각형] round={}%", indent, s.round_rate);
-                println!("{}  선: color={:#010x}, width={}, style={:#06x}",
-                    indent, s.drawing.border_line.color, s.drawing.border_line.width, s.drawing.border_line.attr);
-                println!("{}  채우기: {:?}{}", indent, s.drawing.fill.fill_type,
-                    if let Some(ref img) = s.drawing.fill.image { format!(", image=bin_data_id={}, mode={:?}", img.bin_data_id, img.fill_mode) } else { String::new() });
+                println!(
+                    "{}  선: color={:#010x}, width={}, style={:#06x}",
+                    indent,
+                    s.drawing.border_line.color,
+                    s.drawing.border_line.width,
+                    s.drawing.border_line.attr
+                );
+                println!(
+                    "{}  채우기: {:?}{}",
+                    indent,
+                    s.drawing.fill.fill_type,
+                    if let Some(ref img) = s.drawing.fill.image {
+                        format!(
+                            ", image=bin_data_id={}, mode={:?}",
+                            img.bin_data_id, img.fill_mode
+                        )
+                    } else {
+                        String::new()
+                    }
+                );
                 dump_common_fn(&s.common, indent);
                 dump_sa_fn(&s.drawing.shape_attr, indent);
                 if let Some(tb) = &s.drawing.text_box {
@@ -1291,18 +1715,38 @@ fn dump_controls(args: &[String]) {
                         let text_preview = if tp.text.is_empty() {
                             "(빈)".to_string()
                         } else if tp.text.chars().count() > 60 {
-                            let end = tp.text.char_indices().nth(60).map(|(i,_)|i).unwrap_or(tp.text.len());
+                            let end = tp
+                                .text
+                                .char_indices()
+                                .nth(60)
+                                .map(|(i, _)| i)
+                                .unwrap_or(tp.text.len());
                             format!("\"{}...\"", &tp.text[..end])
                         } else {
                             format!("\"{}\"", tp.text)
                         };
-                        println!("{}    p[{}]: ps_id={}, cc={}, text={}, ls_count={}, ctrls={}",
-                            indent, tpi, tp.para_shape_id, tp.char_count, text_preview,
-                            tp.line_segs.len(), tp.controls.len());
+                        println!(
+                            "{}    p[{}]: ps_id={}, cc={}, text={}, ls_count={}, ctrls={}",
+                            indent,
+                            tpi,
+                            tp.para_shape_id,
+                            tp.char_count,
+                            text_preview,
+                            tp.line_segs.len(),
+                            tp.controls.len()
+                        );
                         for (li, ls) in tp.line_segs.iter().enumerate() {
-                            println!("{}      ls[{}]: vpos={}, lh={}, th={}, bl={}, cs={}, sw={}",
-                                indent, li, ls.vertical_pos, ls.line_height, ls.text_height,
-                                ls.baseline_distance, ls.column_start, ls.segment_width);
+                            println!(
+                                "{}      ls[{}]: vpos={}, lh={}, th={}, bl={}, cs={}, sw={}",
+                                indent,
+                                li,
+                                ls.vertical_pos,
+                                ls.line_height,
+                                ls.text_height,
+                                ls.baseline_distance,
+                                ls.column_start,
+                                ls.segment_width
+                            );
                         }
                     }
                 }
@@ -1327,7 +1771,10 @@ fn dump_controls(args: &[String]) {
                     let max_x = s.points.iter().map(|p| p.x).max().unwrap();
                     let min_y = s.points.iter().map(|p| p.y).min().unwrap();
                     let max_y = s.points.iter().map(|p| p.y).max().unwrap();
-                    println!("{}  좌표범위: x=[{},{}], y=[{},{}]", indent, min_x, max_x, min_y, max_y);
+                    println!(
+                        "{}  좌표범위: x=[{},{}], y=[{},{}]",
+                        indent, min_x, max_x, min_y, max_y
+                    );
                 }
             }
             ShapeObject::Curve(s) => {
@@ -1351,12 +1798,26 @@ fn dump_controls(args: &[String]) {
                 dump_sa_fn(&p.shape_attr, indent);
             }
             ShapeObject::Chart(c) => {
-                println!("{}[차트] type={:?} series={} raw_chart_data={}B", indent, c.chart_type, c.series.len(), c.raw_chart_data.len());
+                println!(
+                    "{}[차트] type={:?} series={} raw_chart_data={}B",
+                    indent,
+                    c.chart_type,
+                    c.series.len(),
+                    c.raw_chart_data.len()
+                );
                 dump_common_fn(&c.common, indent);
                 dump_sa_fn(&c.drawing.shape_attr, indent);
             }
             ShapeObject::Ole(o) => {
-                println!("{}[OLE] bin_data_id={} extent={}x{} flags=0x{:02X} raw={}B", indent, o.bin_data_id, o.extent_x, o.extent_y, o.flags, o.raw_tag_data.len());
+                println!(
+                    "{}[OLE] bin_data_id={} extent={}x{} flags=0x{:02X} raw={}B",
+                    indent,
+                    o.bin_data_id,
+                    o.extent_x,
+                    o.extent_y,
+                    o.flags,
+                    o.raw_tag_data.len()
+                );
                 dump_common_fn(&o.common, indent);
                 dump_sa_fn(&o.drawing.shape_attr, indent);
             }
@@ -1365,18 +1826,30 @@ fn dump_controls(args: &[String]) {
 
     for (sec_idx, section) in document.sections.iter().enumerate() {
         if let Some(fs) = filter_section {
-            if sec_idx != fs { continue; }
+            if sec_idx != fs {
+                continue;
+            }
         }
 
         let pd = &section.section_def.page_def;
         println!("=== 구역 {} ===", sec_idx);
-        println!("  용지: {:.1}mm × {:.1}mm ({}×{} HU), {}",
-            hu_to_mm(pd.width), hu_to_mm(pd.height), pd.width, pd.height,
-            if pd.landscape { "가로" } else { "세로" });
-        println!("  여백: 좌={:.1} 우={:.1} 상={:.1} 하={:.1} 머리말={:.1} 꼬리말={:.1} mm",
-            hu_to_mm(pd.margin_left), hu_to_mm(pd.margin_right),
-            hu_to_mm(pd.margin_top), hu_to_mm(pd.margin_bottom),
-            hu_to_mm(pd.margin_header), hu_to_mm(pd.margin_footer));
+        println!(
+            "  용지: {:.1}mm × {:.1}mm ({}×{} HU), {}",
+            hu_to_mm(pd.width),
+            hu_to_mm(pd.height),
+            pd.width,
+            pd.height,
+            if pd.landscape { "가로" } else { "세로" }
+        );
+        println!(
+            "  여백: 좌={:.1} 우={:.1} 상={:.1} 하={:.1} 머리말={:.1} 꼬리말={:.1} mm",
+            hu_to_mm(pd.margin_left),
+            hu_to_mm(pd.margin_right),
+            hu_to_mm(pd.margin_top),
+            hu_to_mm(pd.margin_bottom),
+            hu_to_mm(pd.margin_header),
+            hu_to_mm(pd.margin_footer)
+        );
 
         // 바탕쪽 정보
         if !section.section_def.master_pages.is_empty() {
@@ -1386,16 +1859,29 @@ fn dump_controls(args: &[String]) {
                     mi, mp.apply_to, mp.paragraphs.len(), mp.text_width, mp.text_height,
                     mp.is_extension, mp.overlap, mp.ext_flags, mp.text_ref, mp.num_ref);
                 for (pi, para) in mp.paragraphs.iter().enumerate() {
-                    println!("      p[{}]: cc={}, text=\"{}\"", pi, para.controls.len(),
-                        if para.text.is_empty() { "(빈 문단)".to_string() } else { para.text.chars().take(30).collect::<String>() });
+                    println!(
+                        "      p[{}]: cc={}, text=\"{}\"",
+                        pi,
+                        para.controls.len(),
+                        if para.text.is_empty() {
+                            "(빈 문단)".to_string()
+                        } else {
+                            para.text.chars().take(30).collect::<String>()
+                        }
+                    );
                     for (ci, ctrl) in para.controls.iter().enumerate() {
                         let ctrl_name = match ctrl {
                             Control::Table(t) => {
-                                let cell_texts: Vec<String> = t.cells.iter().take(3)
+                                let cell_texts: Vec<String> = t
+                                    .cells
+                                    .iter()
+                                    .take(3)
                                     .map(|c| {
-                                        c.paragraphs.iter()
+                                        c.paragraphs
+                                            .iter()
                                             .map(|p| p.text.chars().take(20).collect::<String>())
-                                            .collect::<Vec<_>>().join("|")
+                                            .collect::<Vec<_>>()
+                                            .join("|")
                                     })
                                     .collect();
                                 format!("표({}x{}, tac={}, wrap={:?}, vert={:?}/{}, horz={:?}/{}, size={}x{}, cells=[{}])",
@@ -1404,7 +1890,7 @@ fn dump_controls(args: &[String]) {
                                     t.common.horz_rel_to, t.common.horizontal_offset,
                                     t.common.width, t.common.height,
                                     cell_texts.join("; "))
-                            },
+                            }
                             Control::Shape(s) => {
                                 let mut desc = format!("도형(ctrl_id=0x{:08X}, w={}, h={}, attr=0x{:08X}, wc={:?}, hc={:?})",
                                     s.common().ctrl_id, s.common().width, s.common().height,
@@ -1414,19 +1900,35 @@ fn dump_controls(args: &[String]) {
                                     desc += &format!(" 글상자({}문단)", tb.paragraphs.len());
                                     for (tpi, tp) in tb.paragraphs.iter().enumerate() {
                                         let tp_text: String = tp.text.chars().take(20).collect();
-                                        desc += &format!("\n          tb_p[{}]: cc={} text=\"{}\"", tpi, tp.controls.len(), tp_text);
+                                        desc += &format!(
+                                            "\n          tb_p[{}]: cc={} text=\"{}\"",
+                                            tpi,
+                                            tp.controls.len(),
+                                            tp_text
+                                        );
                                         for (tci, tc) in tp.controls.iter().enumerate() {
                                             let tc_name = match tc {
-                                                Control::AutoNumber(an) => format!("자동번호({:?})", an.number_type),
+                                                Control::AutoNumber(an) => {
+                                                    format!("자동번호({:?})", an.number_type)
+                                                }
                                                 _ => format!("{:?}", std::mem::discriminant(tc)),
                                             };
-                                            desc += &format!("\n            tb_ctrl[{}]: {}", tci, tc_name);
+                                            desc += &format!(
+                                                "\n            tb_ctrl[{}]: {}",
+                                                tci, tc_name
+                                            );
                                         }
                                     }
                                 }
                                 desc
                             }
-                            Control::Picture(p) => format!("그림(bin_id={}, w={}, h={}, tac={})", p.image_attr.bin_data_id, p.common.width, p.common.height, p.common.treat_as_char),
+                            Control::Picture(p) => format!(
+                                "그림(bin_id={}, w={}, h={}, tac={})",
+                                p.image_attr.bin_data_id,
+                                p.common.width,
+                                p.common.height,
+                                p.common.treat_as_char
+                            ),
                             Control::Header(_) => "머리말".to_string(),
                             Control::Footer(_) => "꼬리말".to_string(),
                             _ => format!("{:?}", std::mem::discriminant(ctrl)),
@@ -1442,14 +1944,21 @@ fn dump_controls(args: &[String]) {
 
         for (para_idx, para) in section.paragraphs.iter().enumerate() {
             if let Some(fp) = filter_para {
-                if para_idx != fp { continue; }
+                if para_idx != fp {
+                    continue;
+                }
             }
 
             let text_preview = if para.text.is_empty() {
                 "(빈 문단)".to_string()
             } else {
                 let preview = if para.text.chars().count() > 50 {
-                    let end = para.text.char_indices().nth(50).map(|(i,_)|i).unwrap_or(para.text.len());
+                    let end = para
+                        .text
+                        .char_indices()
+                        .nth(50)
+                        .map(|(i, _)| i)
+                        .unwrap_or(para.text.len());
                     format!("\"{}...\"", &para.text[..end])
                 } else {
                     format!("\"{}\"", para.text)
@@ -1458,43 +1967,81 @@ fn dump_controls(args: &[String]) {
             };
 
             let break_info = break_str(&para.column_type);
-            println!("\n--- 문단 {}.{} --- cc={}, text_len={}, controls={} {}",
-                sec_idx, para_idx, para.char_count, para.text.chars().count(),
-                para.controls.len(), break_info);
+            println!(
+                "\n--- 문단 {}.{} --- cc={}, text_len={}, controls={} {}",
+                sec_idx,
+                para_idx,
+                para.char_count,
+                para.text.chars().count(),
+                para.controls.len(),
+                break_info
+            );
             println!("  텍스트: {}", text_preview);
             // char_shapes 출력
             if !para.char_shapes.is_empty() {
                 let text_chars: Vec<char> = para.text.chars().collect();
                 for (ci, cs) in para.char_shapes.iter().enumerate() {
-                    let next_pos = para.char_shapes.get(ci + 1).map(|n| n.start_pos).unwrap_or(u32::MAX);
-                    let char_at = text_chars.iter().enumerate()
+                    let next_pos = para
+                        .char_shapes
+                        .get(ci + 1)
+                        .map(|n| n.start_pos)
+                        .unwrap_or(u32::MAX);
+                    let char_at = text_chars
+                        .iter()
+                        .enumerate()
                         .find(|(i, _)| {
-                            if *i < para.char_offsets.len() { para.char_offsets[*i] >= cs.start_pos && para.char_offsets[*i] < next_pos }
-                            else { false }
+                            if *i < para.char_offsets.len() {
+                                para.char_offsets[*i] >= cs.start_pos
+                                    && para.char_offsets[*i] < next_pos
+                            } else {
+                                false
+                            }
                         })
                         .map(|(_, c)| *c);
-                    if let Some(chs) = document.doc_info.char_shapes.get(cs.char_shape_id as usize) {
+                    if let Some(chs) = document.doc_info.char_shapes.get(cs.char_shape_id as usize)
+                    {
                         let bold = (chs.attr & 0x02) != 0;
                         let spacing = chs.spacings[0]; // 한국어 자간
                         let ratio = chs.ratios[0]; // 한국어 장평
-                        println!("  [CS] pos={} id={} bold={} spacing={}% ratio={}% char={:?}",
-                            cs.start_pos, cs.char_shape_id, bold, spacing, ratio,
-                            char_at.map(|c| c.to_string()).unwrap_or_default());
+                        println!(
+                            "  [CS] pos={} id={} bold={} spacing={}% ratio={}% char={:?}",
+                            cs.start_pos,
+                            cs.char_shape_id,
+                            bold,
+                            spacing,
+                            ratio,
+                            char_at.map(|c| c.to_string()).unwrap_or_default()
+                        );
                     }
                 }
             }
-            if let Some(ps) = document.doc_info.para_shapes.get(para.para_shape_id as usize) {
+            if let Some(ps) = document
+                .doc_info
+                .para_shapes
+                .get(para.para_shape_id as usize)
+            {
                 // 문단 모양 기본 정보 (항상 출력)
-                println!("  [PS] ps_id={} align={:?} spacing: before={} after={} line={}/{:?}",
-                    para.para_shape_id, ps.alignment,
-                    ps.spacing_before, ps.spacing_after,
-                    ps.line_spacing, ps.line_spacing_type);
-                println!("       margins: left={} right={} indent={} border_fill_id={}",
-                    ps.margin_left, ps.margin_right, ps.indent, ps.border_fill_id);
+                println!(
+                    "  [PS] ps_id={} align={:?} spacing: before={} after={} line={}/{:?}",
+                    para.para_shape_id,
+                    ps.alignment,
+                    ps.spacing_before,
+                    ps.spacing_after,
+                    ps.line_spacing,
+                    ps.line_spacing_type
+                );
+                println!(
+                    "       margins: left={} right={} indent={} border_fill_id={}",
+                    ps.margin_left, ps.margin_right, ps.indent, ps.border_fill_id
+                );
                 if ps.border_fill_id > 0 {
-                    println!("       border_spacing: left={} right={} top={} bottom={}",
-                        ps.border_spacing[0], ps.border_spacing[1],
-                        ps.border_spacing[2], ps.border_spacing[3]);
+                    println!(
+                        "       border_spacing: left={} right={} top={} bottom={}",
+                        ps.border_spacing[0],
+                        ps.border_spacing[1],
+                        ps.border_spacing[2],
+                        ps.border_spacing[3]
+                    );
                 }
                 if ps.head_type != rhwp::model::style::HeadType::None {
                     println!("       head={:?} level={} num_id={} attr1=0x{:08X} attr2=0x{:08X} raw_extra={:?}",
@@ -1504,13 +2051,32 @@ fn dump_controls(args: &[String]) {
                 {
                     let td_id = ps.tab_def_id;
                     if let Some(td) = document.doc_info.tab_defs.get(td_id as usize) {
-                        let tabs_str: Vec<String> = td.tabs.iter().enumerate()
-                            .map(|(i, t)| format!("tab[{}] pos={} ({:.1}mm) type={} fill={}",
-                                i, t.position, hu_to_mm(t.position), t.tab_type, t.fill_type))
+                        let tabs_str: Vec<String> = td
+                            .tabs
+                            .iter()
+                            .enumerate()
+                            .map(|(i, t)| {
+                                format!(
+                                    "tab[{}] pos={} ({:.1}mm) type={} fill={}",
+                                    i,
+                                    t.position,
+                                    hu_to_mm(t.position),
+                                    t.tab_type,
+                                    t.fill_type
+                                )
+                            })
                             .collect();
-                        println!("       tab_def_id={} auto_left={} auto_right={} tabs=[{}]",
-                            td_id, td.auto_tab_left, td.auto_tab_right,
-                            if tabs_str.is_empty() { "(없음)".to_string() } else { tabs_str.join(", ") });
+                        println!(
+                            "       tab_def_id={} auto_left={} auto_right={} tabs=[{}]",
+                            td_id,
+                            td.auto_tab_left,
+                            td.auto_tab_right,
+                            if tabs_str.is_empty() {
+                                "(없음)".to_string()
+                            } else {
+                                tabs_str.join(", ")
+                            }
+                        );
                     } else {
                         println!("       tab_def_id={} (정의 없음)", td_id);
                     }
@@ -1534,50 +2100,82 @@ fn dump_controls(args: &[String]) {
                             rhwp::model::page::ColumnType::Distribute => "배분",
                             rhwp::model::page::ColumnType::Parallel => "병행",
                         };
-                        println!("{}단정의: {}단, 유형={}, 간격={:.1}mm({}), 같은너비={}",
-                            prefix, cd.column_count, ct,
-                            hu_to_mm_i(cd.spacing as i32), cd.spacing, cd.same_width);
+                        println!(
+                            "{}단정의: {}단, 유형={}, 간격={:.1}mm({}), 같은너비={}",
+                            prefix,
+                            cd.column_count,
+                            ct,
+                            hu_to_mm_i(cd.spacing as i32),
+                            cd.spacing,
+                            cd.same_width
+                        );
                         if !cd.widths.is_empty() {
                             // 비례값일 경우 body_width 기준으로 실제 mm 변환
                             let body_width_hu = {
                                 let spd = &section.section_def.page_def;
-                                let (pw, _) = if spd.landscape { (spd.height, spd.width) } else { (spd.width, spd.height) };
+                                let (pw, _) = if spd.landscape {
+                                    (spd.height, spd.width)
+                                } else {
+                                    (spd.width, spd.height)
+                                };
                                 (pw - spd.margin_left - spd.margin_right - spd.margin_gutter) as f64
                             };
                             let total: f64 = if cd.proportional_widths {
-                                cd.widths.iter().chain(cd.gaps.iter())
-                                    .map(|&v| (v as u16) as f64).sum()
+                                cd.widths
+                                    .iter()
+                                    .chain(cd.gaps.iter())
+                                    .map(|&v| (v as u16) as f64)
+                                    .sum()
                             } else {
                                 1.0
                             };
-                            let cols_info: Vec<String> = cd.widths.iter().enumerate()
+                            let cols_info: Vec<String> = cd
+                                .widths
+                                .iter()
+                                .enumerate()
                                 .map(|(i, w)| {
                                     let gap = cd.gaps.get(i).copied().unwrap_or(0);
                                     if cd.proportional_widths && total > 0.0 {
                                         let w_hu = (*w as u16) as f64 / total * body_width_hu;
                                         let g_hu = (gap as u16) as f64 / total * body_width_hu;
-                                        format!("너비={:.1}mm 간격={:.1}mm", w_hu * 25.4 / 7200.0, g_hu * 25.4 / 7200.0)
+                                        format!(
+                                            "너비={:.1}mm 간격={:.1}mm",
+                                            w_hu * 25.4 / 7200.0,
+                                            g_hu * 25.4 / 7200.0
+                                        )
                                     } else {
-                                        format!("너비={:.1}mm 간격={:.1}mm", hu_to_mm_i(*w as i32), hu_to_mm_i(gap as i32))
+                                        format!(
+                                            "너비={:.1}mm 간격={:.1}mm",
+                                            hu_to_mm_i(*w as i32),
+                                            hu_to_mm_i(gap as i32)
+                                        )
                                     }
                                 })
                                 .collect();
                             println!("{}  단별: [{}]", prefix, cols_info.join(", "));
                         }
                         if cd.separator_type > 0 {
-                            println!("{}  구분선: type={}, width={}, color={:#010x}",
-                                prefix, cd.separator_type, cd.separator_width, cd.separator_color);
+                            println!(
+                                "{}  구분선: type={}, width={}, color={:#010x}",
+                                prefix, cd.separator_type, cd.separator_width, cd.separator_color
+                            );
                         }
                     }
                     Control::SectionDef(sd) => {
                         let spd = &sd.page_def;
-                        println!("{}구역정의: 용지 {:.1}×{:.1}mm, {}, flags=0x{:08X}",
+                        println!(
+                            "{}구역정의: 용지 {:.1}×{:.1}mm, {}, flags=0x{:08X}",
                             prefix,
-                            hu_to_mm(spd.width), hu_to_mm(spd.height),
-                            if spd.landscape { "가로" } else { "세로" }, sd.flags);
+                            hu_to_mm(spd.width),
+                            hu_to_mm(spd.height),
+                            if spd.landscape { "가로" } else { "세로" },
+                            sd.flags
+                        );
                         if sd.hide_header || sd.hide_footer || sd.hide_master_page {
-                            println!("{}  감추기: 머리말={} 꼬리말={} 바탕쪽={}",
-                                prefix, sd.hide_header, sd.hide_footer, sd.hide_master_page);
+                            println!(
+                                "{}  감추기: 머리말={} 꼬리말={} 바탕쪽={}",
+                                prefix, sd.hide_header, sd.hide_footer, sd.hide_master_page
+                            );
                         }
                     }
                     Control::Table(table) => {
@@ -1588,8 +2186,16 @@ fn dump_controls(args: &[String]) {
                             table.cell_spacing);
                         if !table.zones.is_empty() {
                             for (zi, z) in table.zones.iter().enumerate() {
-                                println!("{}  zone[{}] row={}..{} col={}..{} bf={}",
-                                    prefix, zi, z.start_row, z.end_row, z.start_col, z.end_col, z.border_fill_id);
+                                println!(
+                                    "{}  zone[{}] row={}..{} col={}..{} bf={}",
+                                    prefix,
+                                    zi,
+                                    z.start_row,
+                                    z.end_row,
+                                    z.start_col,
+                                    z.end_col,
+                                    z.border_fill_id
+                                );
                             }
                         }
                         {
@@ -1598,9 +2204,16 @@ fn dump_controls(args: &[String]) {
                                 prefix, c.treat_as_char, wrap_str(&c.text_wrap),
                                 vert_str(&c.vert_rel_to), c.vertical_offset, hu_to_mm(c.vertical_offset),
                                 horz_str(&c.horz_rel_to), c.horizontal_offset, hu_to_mm(c.horizontal_offset));
-                            println!("{}  [common] size={}×{}({:.1}×{:.1}mm), valign={:?}, halign={:?}",
-                                prefix, c.width, c.height, hu_to_mm(c.width), hu_to_mm(c.height),
-                                c.vert_align, c.horz_align);
+                            println!(
+                                "{}  [common] size={}×{}({:.1}×{:.1}mm), valign={:?}, halign={:?}",
+                                prefix,
+                                c.width,
+                                c.height,
+                                hu_to_mm(c.width),
+                                hu_to_mm(c.height),
+                                c.vert_align,
+                                c.horz_align
+                            );
                             println!("{}  [outer_margin] left={:.1}mm({}) right={:.1}mm({}) top={:.1}mm({}) bottom={:.1}mm({})",
                                 prefix,
                                 hu_to_mm_i(table.outer_margin_left as i32), table.outer_margin_left,
@@ -1608,15 +2221,26 @@ fn dump_controls(args: &[String]) {
                                 hu_to_mm_i(table.outer_margin_top as i32), table.outer_margin_top,
                                 hu_to_mm_i(table.outer_margin_bottom as i32), table.outer_margin_bottom);
                             if table.raw_ctrl_data.len() >= 20 {
-                                println!("{}  [raw] {:02X?}", prefix, &table.raw_ctrl_data[..20.min(table.raw_ctrl_data.len())]);
+                                println!(
+                                    "{}  [raw] {:02X?}",
+                                    prefix,
+                                    &table.raw_ctrl_data[..20.min(table.raw_ctrl_data.len())]
+                                );
                             }
                         }
                         // 셀 상세 출력
-                        fn dump_table_deep(table: &rhwp::model::table::Table, indent: &str, depth: usize) {
+                        fn dump_table_deep(
+                            table: &rhwp::model::table::Table,
+                            indent: &str,
+                            depth: usize,
+                        ) {
                             for (ci, cell) in table.cells.iter().enumerate() {
-                                let text_preview: String = cell.paragraphs.iter()
+                                let text_preview: String = cell
+                                    .paragraphs
+                                    .iter()
                                     .map(|p| p.text.chars().take(30).collect::<String>())
-                                    .collect::<Vec<_>>().join("|");
+                                    .collect::<Vec<_>>()
+                                    .join("|");
                                 println!("{}셀[{}] r={},c={} rs={},cs={} h={} w={} pad=({},{},{},{}) aim={} bf={} paras={} text=\"{}\"",
                                     indent, ci, cell.row, cell.col, cell.row_span, cell.col_span,
                                     cell.height, cell.width,
@@ -1629,12 +2253,29 @@ fn dump_controls(args: &[String]) {
                                 // 셀 내 LINE_SEG 상세
                                 for (pi, cp) in cell.paragraphs.iter().enumerate() {
                                     if !cp.line_segs.is_empty() || !cp.controls.is_empty() {
-                                        let ls_info: Vec<String> = cp.line_segs.iter().enumerate()
-                                            .map(|(li, ls)| format!("ls[{}] vpos={} lh={} ls={}", li, ls.vertical_pos, ls.line_height, ls.line_spacing))
+                                        let ls_info: Vec<String> = cp
+                                            .line_segs
+                                            .iter()
+                                            .enumerate()
+                                            .map(|(li, ls)| {
+                                                format!(
+                                                    "ls[{}] vpos={} lh={} ls={}",
+                                                    li,
+                                                    ls.vertical_pos,
+                                                    ls.line_height,
+                                                    ls.line_spacing
+                                                )
+                                            })
                                             .collect();
-                                        println!("{}  p[{}] ps_id={} ctrls={} text_len={} {}",
-                                            indent, pi, cp.para_shape_id, cp.controls.len(),
-                                            cp.text.len(), ls_info.join(", "));
+                                        println!(
+                                            "{}  p[{}] ps_id={} ctrls={} text_len={} {}",
+                                            indent,
+                                            pi,
+                                            cp.para_shape_id,
+                                            cp.controls.len(),
+                                            cp.text.len(),
+                                            ls_info.join(", ")
+                                        );
                                     }
                                     // 셀 내부 컨트롤 상세
                                     for (ci, ctrl) in cp.controls.iter().enumerate() {
@@ -1653,8 +2294,14 @@ fn dump_controls(args: &[String]) {
                                                     p.crop.left, p.crop.top, p.crop.right, p.crop.bottom);
                                             }
                                             Control::Shape(s) => {
-                                                println!("{}    ctrl[{}] {}: tac={}, wrap={:?}",
-                                                    indent, ci, s.shape_name(), s.common().treat_as_char, s.common().text_wrap);
+                                                println!(
+                                                    "{}    ctrl[{}] {}: tac={}, wrap={:?}",
+                                                    indent,
+                                                    ci,
+                                                    s.shape_name(),
+                                                    s.common().treat_as_char,
+                                                    s.common().text_wrap
+                                                );
                                             }
                                             _ => {}
                                         }
@@ -1695,30 +2342,58 @@ fn dump_controls(args: &[String]) {
                             prefix, pic.border_x, pic.border_y,
                             pic.border_color, pic.border_width, pic.border_width as f64 / 7200.0 * 25.4,
                             pic.border_attr);
-                        println!("{}  crop=({},{},{},{}) crop_mm=({:.2},{:.2},{:.2},{:.2})",
-                            prefix, pic.crop.left, pic.crop.top, pic.crop.right, pic.crop.bottom,
-                            pic.crop.left as f64 / 7200.0 * 25.4, pic.crop.top as f64 / 7200.0 * 25.4,
-                            pic.crop.right as f64 / 7200.0 * 25.4, pic.crop.bottom as f64 / 7200.0 * 25.4);
+                        println!(
+                            "{}  crop=({},{},{},{}) crop_mm=({:.2},{:.2},{:.2},{:.2})",
+                            prefix,
+                            pic.crop.left,
+                            pic.crop.top,
+                            pic.crop.right,
+                            pic.crop.bottom,
+                            pic.crop.left as f64 / 7200.0 * 25.4,
+                            pic.crop.top as f64 / 7200.0 * 25.4,
+                            pic.crop.right as f64 / 7200.0 * 25.4,
+                            pic.crop.bottom as f64 / 7200.0 * 25.4
+                        );
                         dump_common(&pic.common, "  ");
                     }
                     Control::Header(h) => {
-                        let text: String = h.paragraphs.iter()
+                        let text: String = h
+                            .paragraphs
+                            .iter()
                             .filter(|p| !p.text.is_empty())
                             .map(|p| p.text.clone())
                             .collect::<Vec<_>>()
                             .join(" ");
-                        println!("{}머리말({:?}): paras={} \"{}\"", prefix, h.apply_to, h.paragraphs.len(), text);
+                        println!(
+                            "{}머리말({:?}): paras={} \"{}\"",
+                            prefix,
+                            h.apply_to,
+                            h.paragraphs.len(),
+                            text
+                        );
                         for (hpi, hp) in h.paragraphs.iter().enumerate() {
                             if !hp.controls.is_empty() {
                                 for (hci, hc) in hp.controls.iter().enumerate() {
                                     let cn = match hc {
-                                        Control::AutoNumber(an) => format!("자동번호({:?})", an.number_type),
+                                        Control::AutoNumber(an) => {
+                                            format!("자동번호({:?})", an.number_type)
+                                        }
                                         Control::Shape(s) => {
                                             let c = s.common();
-                                            let mut desc = format!("Shape horz={:?}/{} halign={:?} w={} h={}",
-                                                c.horz_rel_to, c.horizontal_offset, c.horz_align, c.width, c.height);
-                                            if let Some(tb) = s.drawing().and_then(|d| d.text_box.as_ref()) {
-                                                let text: String = tb.paragraphs.iter()
+                                            let mut desc = format!(
+                                                "Shape horz={:?}/{} halign={:?} w={} h={}",
+                                                c.horz_rel_to,
+                                                c.horizontal_offset,
+                                                c.horz_align,
+                                                c.width,
+                                                c.height
+                                            );
+                                            if let Some(tb) =
+                                                s.drawing().and_then(|d| d.text_box.as_ref())
+                                            {
+                                                let text: String = tb
+                                                    .paragraphs
+                                                    .iter()
                                                     .flat_map(|p| p.text.chars().take(20))
                                                     .collect();
                                                 desc += &format!(" text={:?}", text);
@@ -1726,32 +2401,65 @@ fn dump_controls(args: &[String]) {
                                             desc
                                         }
                                         Control::Table(t) => {
-                                            let mut desc = format!("표 {}행×{}열 셀={}", t.row_count, t.col_count, t.cells.len());
+                                            let mut desc = format!(
+                                                "표 {}행×{}열 셀={}",
+                                                t.row_count,
+                                                t.col_count,
+                                                t.cells.len()
+                                            );
                                             for (si, cell) in t.cells.iter().enumerate() {
-                                                let cell_text: String = cell.paragraphs.iter()
+                                                let cell_text: String = cell
+                                                    .paragraphs
+                                                    .iter()
                                                     .flat_map(|p| p.text.chars().take(20))
                                                     .collect();
-                                                desc += &format!("\n{}    셀[{}] text={:?}", prefix, si, cell_text);
-                                                for (cpi, cp) in cell.paragraphs.iter().enumerate() {
-                                                    for (cci, cc) in cp.controls.iter().enumerate() {
+                                                desc += &format!(
+                                                    "\n{}    셀[{}] text={:?}",
+                                                    prefix, si, cell_text
+                                                );
+                                                for (cpi, cp) in cell.paragraphs.iter().enumerate()
+                                                {
+                                                    for (cci, cc) in cp.controls.iter().enumerate()
+                                                    {
                                                         let ccn = match cc {
-                                                            Control::AutoNumber(an) => format!("자동번호({:?})", an.number_type),
+                                                            Control::AutoNumber(an) => format!(
+                                                                "자동번호({:?})",
+                                                                an.number_type
+                                                            ),
                                                             Control::Shape(s) => {
-                                            let c = s.common();
-                                            let mut d = format!("Shape vert={:?}/{} valign={:?} horz={:?}/{} halign={:?} w={} h={}",
+                                                                let c = s.common();
+                                                                let mut d = format!("Shape vert={:?}/{} valign={:?} horz={:?}/{} halign={:?} w={} h={}",
                                                 c.vert_rel_to, c.vertical_offset, c.vert_align,
                                                 c.horz_rel_to, c.horizontal_offset, c.horz_align, c.width, c.height);
-                                            if let Some(tb) = s.drawing().and_then(|dd| dd.text_box.as_ref()) {
-                                                for (tpi, tp) in tb.paragraphs.iter().enumerate() {
-                                                    let t: String = tp.text.chars().take(30).collect();
-                                                    d += &format!(" tb_p[{}] ps_id={} text={:?}", tpi, tp.para_shape_id, t);
-                                                }
-                                            }
-                                            d
-                                        }
-                                        _ => format!("{:?}", std::mem::discriminant(cc)),
+                                                                if let Some(tb) =
+                                                                    s.drawing().and_then(|dd| {
+                                                                        dd.text_box.as_ref()
+                                                                    })
+                                                                {
+                                                                    for (tpi, tp) in tb
+                                                                        .paragraphs
+                                                                        .iter()
+                                                                        .enumerate()
+                                                                    {
+                                                                        let t: String = tp
+                                                                            .text
+                                                                            .chars()
+                                                                            .take(30)
+                                                                            .collect();
+                                                                        d += &format!(" tb_p[{}] ps_id={} text={:?}", tpi, tp.para_shape_id, t);
+                                                                    }
+                                                                }
+                                                                d
+                                                            }
+                                                            _ => format!(
+                                                                "{:?}",
+                                                                std::mem::discriminant(cc)
+                                                            ),
                                                         };
-                                                        desc += &format!("\n{}      p[{}]c[{}]: {}", prefix, cpi, cci, ccn);
+                                                        desc += &format!(
+                                                            "\n{}      p[{}]c[{}]: {}",
+                                                            prefix, cpi, cci, ccn
+                                                        );
                                                     }
                                                 }
                                             }
@@ -1770,11 +2478,14 @@ fn dump_controls(args: &[String]) {
                                             pic.crop.left, pic.crop.top, pic.crop.right, pic.crop.bottom,
                                             pic.crop.left as f64 / 7200.0 * 25.4, pic.crop.top as f64 / 7200.0 * 25.4,
                                             pic.crop.right as f64 / 7200.0 * 25.4, pic.crop.bottom as f64 / 7200.0 * 25.4)
-                                        },
+                                        }
                                         _ => format!("{:?}", std::mem::discriminant(hc)),
                                     };
                                     let display = if cn.chars().count() > 30 {
-                                        format!("{}...(truncated)", cn.chars().take(30).collect::<String>())
+                                        format!(
+                                            "{}...(truncated)",
+                                            cn.chars().take(30).collect::<String>()
+                                        )
                                     } else {
                                         cn
                                     };
@@ -1784,12 +2495,20 @@ fn dump_controls(args: &[String]) {
                         }
                     }
                     Control::Footer(f) => {
-                        let text: String = f.paragraphs.iter()
+                        let text: String = f
+                            .paragraphs
+                            .iter()
                             .filter(|p| !p.text.is_empty())
                             .map(|p| p.text.clone())
                             .collect::<Vec<_>>()
                             .join(" ");
-                        println!("{}꼬리말({:?}): paras={} \"{}\"", prefix, f.apply_to, f.paragraphs.len(), text);
+                        println!(
+                            "{}꼬리말({:?}): paras={} \"{}\"",
+                            prefix,
+                            f.apply_to,
+                            f.paragraphs.len(),
+                            text
+                        );
                         for (fpi, fp) in f.paragraphs.iter().enumerate() {
                             if !fp.controls.is_empty() {
                                 for (fci, fc) in fp.controls.iter().enumerate() {
@@ -1807,7 +2526,7 @@ fn dump_controls(args: &[String]) {
                                             pic.crop.left, pic.crop.top, pic.crop.right, pic.crop.bottom,
                                             pic.crop.left as f64 / 7200.0 * 25.4, pic.crop.top as f64 / 7200.0 * 25.4,
                                             pic.crop.right as f64 / 7200.0 * 25.4, pic.crop.bottom as f64 / 7200.0 * 25.4)
-                                        },
+                                        }
                                         _ => format!("{:?}", std::mem::discriminant(fc)),
                                     };
                                     println!("{}  fp[{}] ctrl[{}]: {}", prefix, fpi, fci, cn);
@@ -1822,13 +2541,22 @@ fn dump_controls(args: &[String]) {
                         println!("{}미주: paragraphs={}", prefix, en.paragraphs.len());
                     }
                     Control::AutoNumber(an) => {
-                        println!("{}자동번호: type={:?}, number={}", prefix, an.number_type, an.number);
+                        println!(
+                            "{}자동번호: type={:?}, number={}",
+                            prefix, an.number_type, an.number
+                        );
                     }
                     Control::NewNumber(nn) => {
-                        println!("{}새번호: type={:?}, number={}", prefix, nn.number_type, nn.number);
+                        println!(
+                            "{}새번호: type={:?}, number={}",
+                            prefix, nn.number_type, nn.number
+                        );
                     }
                     Control::PageNumberPos(pn) => {
-                        println!("{}쪽번호위치: format={}, pos={}", prefix, pn.format, pn.position);
+                        println!(
+                            "{}쪽번호위치: format={}, pos={}",
+                            prefix, pn.format, pn.position
+                        );
                     }
                     Control::Bookmark(bm) => {
                         println!("{}책갈피: \"{}\"", prefix, bm.name);
@@ -1848,19 +2576,31 @@ fn dump_controls(args: &[String]) {
                     }
                     Control::Field(f) => {
                         let name = f.field_name().unwrap_or("(이름없음)");
-                        println!("{}필드: {:?} name=\"{}\" cmd=\"{}\"", prefix, f.field_type, name, f.command);
+                        println!(
+                            "{}필드: {:?} name=\"{}\" cmd=\"{}\"",
+                            prefix, f.field_type, name, f.command
+                        );
                     }
                     Control::CharOverlap(co) => {
                         println!("{}글자겹침: {:?}", prefix, co.chars);
                     }
                     Control::Equation(eq) => {
-                        println!("{}수식: script=\"{}\" font_size={} font=\"{}\" size={}x{} tac={}",
-                            prefix, eq.script, eq.font_size, eq.font_name,
-                            eq.common.width, eq.common.height, eq.common.treat_as_char);
+                        println!(
+                            "{}수식: script=\"{}\" font_size={} font=\"{}\" size={}x{} tac={}",
+                            prefix,
+                            eq.script,
+                            eq.font_size,
+                            eq.font_name,
+                            eq.common.width,
+                            eq.common.height,
+                            eq.common.treat_as_char
+                        );
                     }
                     Control::Form(f) => {
-                        println!("{}양식개체: {:?} name=\"{}\" caption=\"{}\" {}x{}",
-                            prefix, f.form_type, f.name, f.caption, f.width, f.height);
+                        println!(
+                            "{}양식개체: {:?} name=\"{}\" caption=\"{}\" {}x{}",
+                            prefix, f.form_type, f.name, f.caption, f.width, f.height
+                        );
                     }
                     Control::Unknown(u) => {
                         println!("{}알수없음: ctrl_id={:#010x}", prefix, u.ctrl_id);
@@ -1870,9 +2610,15 @@ fn dump_controls(args: &[String]) {
         }
     }
 
-    println!("\n=== 완료: {} 구역, {} 문단 ===",
+    println!(
+        "\n=== 완료: {} 구역, {} 문단 ===",
         document.sections.len(),
-        document.sections.iter().map(|s| s.paragraphs.len()).sum::<usize>());
+        document
+            .sections
+            .iter()
+            .map(|s| s.paragraphs.len())
+            .sum::<usize>()
+    );
 }
 
 fn diag_document(args: &[String]) {
@@ -1906,17 +2652,27 @@ fn diag_document(args: &[String]) {
     println!("=== DocInfo 요약 ===");
     println!("  Numbering: {}개", document.doc_info.numberings.len());
     for (i, num) in document.doc_info.numberings.iter().enumerate() {
-        let formats: Vec<String> = num.level_formats.iter()
+        let formats: Vec<String> = num
+            .level_formats
+            .iter()
             .enumerate()
             .filter(|(_, f)| !f.is_empty())
             .map(|(lv, f)| format!("L{}=\"{}\"", lv + 1, f))
             .collect();
-        println!("    [{}] start={}, formats: {}", i, num.start_number, formats.join(", "));
+        println!(
+            "    [{}] start={}, formats: {}",
+            i,
+            num.start_number,
+            formats.join(", ")
+        );
     }
 
     println!("  Bullet: {}개", document.doc_info.bullets.len());
     for (i, bullet) in document.doc_info.bullets.iter().enumerate() {
-        println!("    [{}] char='{}' (U+{:04X})", i, bullet.bullet_char, bullet.bullet_char as u32);
+        println!(
+            "    [{}] char='{}' (U+{:04X})",
+            i, bullet.bullet_char, bullet.bullet_char as u32
+        );
     }
 
     // === ParaShape head_type 분포 ===
@@ -1933,8 +2689,10 @@ fn diag_document(args: &[String]) {
             HeadType::Bullet => count_bullet += 1,
         }
     }
-    println!("  None: {}개, Outline: {}개, Number: {}개, Bullet: {}개",
-        count_none, count_outline, count_number, count_bullet);
+    println!(
+        "  None: {}개, Outline: {}개, Number: {}개, Bullet: {}개",
+        count_none, count_outline, count_number, count_bullet
+    );
 
     // === SectionDef 개요번호 ===
     println!("\n=== SectionDef 개요번호 ===");
@@ -1948,15 +2706,21 @@ fn diag_document(args: &[String]) {
         } else {
             " (없음)".to_string()
         };
-        println!("  구역{}: outline_numbering_id={}{}, flags={:#010x}",
-            sec_idx, sd.outline_numbering_id, num_ref, sd.flags);
+        println!(
+            "  구역{}: outline_numbering_id={}{}, flags={:#010x}",
+            sec_idx, sd.outline_numbering_id, num_ref, sd.flags
+        );
     }
 
     // === 비None head_type 문단 ===
     println!("\n=== 비None head_type 문단 ===");
     for (sec_idx, section) in document.sections.iter().enumerate() {
         for (para_idx, para) in section.paragraphs.iter().enumerate() {
-            if let Some(ps) = document.doc_info.para_shapes.get(para.para_shape_id as usize) {
+            if let Some(ps) = document
+                .doc_info
+                .para_shapes
+                .get(para.para_shape_id as usize)
+            {
                 if ps.head_type != HeadType::None {
                     let text_preview: String = para.text.chars().take(40).collect();
                     let text_display = if para.text.chars().count() > 40 {
@@ -1964,10 +2728,15 @@ fn diag_document(args: &[String]) {
                     } else {
                         format!("\"{}\"", text_preview)
                     };
-                    println!("  구역{}:문단{} head={:?} level={} num_id={} text={}",
-                        sec_idx, para_idx,
-                        ps.head_type, ps.para_level, ps.numbering_id,
-                        text_display);
+                    println!(
+                        "  구역{}:문단{} head={:?} level={} num_id={} text={}",
+                        sec_idx,
+                        para_idx,
+                        ps.head_type,
+                        ps.para_level,
+                        ps.numbering_id,
+                        text_display
+                    );
                 }
             }
         }
@@ -2022,16 +2791,14 @@ fn convert_hwp(args: &[String]) {
 
     // 직렬화
     match doc.export_hwp_native() {
-        Ok(bytes) => {
-            match fs::write(output_path, &bytes) {
-                Ok(_) => {
-                    println!("저장 완료: {} ({}KB)", output_path, bytes.len() / 1024);
-                }
-                Err(e) => {
-                    eprintln!("오류: 파일 저장 실패 - {}: {}", output_path, e);
-                }
+        Ok(bytes) => match fs::write(output_path, &bytes) {
+            Ok(_) => {
+                println!("저장 완료: {} ({}KB)", output_path, bytes.len() / 1024);
             }
-        }
+            Err(e) => {
+                eprintln!("오류: 파일 저장 실패 - {}: {}", output_path, e);
+            }
+        },
         Err(e) => {
             eprintln!("오류: 직렬화 실패 - {}", e);
         }
@@ -2045,46 +2812,83 @@ fn dump_raw_records(args: &[String]) {
     }
     let data = match fs::read(&args[0]) {
         Ok(d) => d,
-        Err(e) => { eprintln!("오류: {}", e); return; }
+        Err(e) => {
+            eprintln!("오류: {}", e);
+            return;
+        }
     };
     use rhwp::parser::cfb_reader::CfbReader;
     use rhwp::parser::record::Record;
     let mut cfb = match CfbReader::open(&data) {
         Ok(c) => c,
-        Err(e) => { eprintln!("오류: {:?}", e); return; }
+        Err(e) => {
+            eprintln!("오류: {:?}", e);
+            return;
+        }
     };
     // FileHeader에서 압축 여부 확인
     let header = cfb.read_stream_raw("FileHeader").unwrap_or_default();
     let compressed = header.len() >= 40 && (header[36] & 0x01) != 0;
     let section = match cfb.read_body_text_section(0, compressed, false) {
         Ok(s) => s,
-        Err(e) => { eprintln!("오류: {:?}", e); return; }
+        Err(e) => {
+            eprintln!("오류: {:?}", e);
+            return;
+        }
     };
     let records = match Record::read_all(&section) {
         Ok(r) => r,
-        Err(e) => { eprintln!("오류: {:?}", e); return; }
+        Err(e) => {
+            eprintln!("오류: {:?}", e);
+            return;
+        }
     };
     let tag_name = |id: u16| -> &str {
         match id {
-            66 => "PARA_HEADER", 67 => "PARA_TEXT", 68 => "PARA_CHAR_SHAPE",
-            69 => "PARA_LINE_SEG", 70 => "PARA_RANGE_TAG", 71 => "CTRL_HEADER",
-            72 => "LIST_HEADER", 73 => "PAGE_DEF", 74 => "FOOTNOTE_SHAPE",
-            75 => "PAGE_BORDER_FILL", 76 => "SHAPE_COMPONENT", 77 => "TABLE",
-            78 => "SC_LINE", 79 => "SC_RECT", 80 => "SC_ELLIPSE",
-            81 => "SC_ARC", 82 => "SC_POLYGON", 83 => "SC_CURVE",
-            85 => "SC_PICTURE", 86 => "SC_CONTAINER", 89 => "CTRL_DATA",
+            66 => "PARA_HEADER",
+            67 => "PARA_TEXT",
+            68 => "PARA_CHAR_SHAPE",
+            69 => "PARA_LINE_SEG",
+            70 => "PARA_RANGE_TAG",
+            71 => "CTRL_HEADER",
+            72 => "LIST_HEADER",
+            73 => "PAGE_DEF",
+            74 => "FOOTNOTE_SHAPE",
+            75 => "PAGE_BORDER_FILL",
+            76 => "SHAPE_COMPONENT",
+            77 => "TABLE",
+            78 => "SC_LINE",
+            79 => "SC_RECT",
+            80 => "SC_ELLIPSE",
+            81 => "SC_ARC",
+            82 => "SC_POLYGON",
+            83 => "SC_CURVE",
+            85 => "SC_PICTURE",
+            86 => "SC_CONTAINER",
+            89 => "CTRL_DATA",
             _ => "?",
         }
     };
     for (i, rec) in records.iter().enumerate() {
         let indent = "  ".repeat(rec.level as usize);
-        println!("[{:3}] {}tag={:<3} {:16} lv={} sz={}",
-            i, indent, rec.tag_id, tag_name(rec.tag_id), rec.level, rec.data.len());
+        println!(
+            "[{:3}] {}tag={:<3} {:16} lv={} sz={}",
+            i,
+            indent,
+            rec.tag_id,
+            tag_name(rec.tag_id),
+            rec.level,
+            rec.data.len()
+        );
         // shape 관련 레코드만 hex 덤프
         if matches!(rec.tag_id, 71 | 72 | 76 | 79 | 85 | 89) {
             // 16바이트씩 나눠서 hex 출력
             for chunk in rec.data.chunks(16) {
-                let hex: String = chunk.iter().map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join(" ");
+                let hex: String = chunk
+                    .iter()
+                    .map(|b| format!("{:02x}", b))
+                    .collect::<Vec<_>>()
+                    .join(" ");
                 println!("       {}  {}", indent, hex);
             }
         }
@@ -2092,26 +2896,57 @@ fn dump_raw_records(args: &[String]) {
 }
 
 fn test_shape_roundtrip(args: &[String]) {
-    let input = if args.is_empty() { "saved/g555-s.hwp" } else { &args[0] };
-    let output = if args.len() > 1 { &args[1] } else { "/tmp/test-shape-out.hwp" };
+    let input = if args.is_empty() {
+        "saved/g555-s.hwp"
+    } else {
+        &args[0]
+    };
+    let output = if args.len() > 1 {
+        &args[1]
+    } else {
+        "/tmp/test-shape-out.hwp"
+    };
 
     let data = match fs::read(input) {
         Ok(d) => d,
-        Err(e) => { eprintln!("입력 파일 읽기 오류: {}", e); return; }
+        Err(e) => {
+            eprintln!("입력 파일 읽기 오류: {}", e);
+            return;
+        }
     };
 
     let mut doc = match rhwp::wasm_api::HwpDocument::from_bytes(&data) {
         Ok(d) => d,
-        Err(e) => { eprintln!("HWP 파싱 오류: {:?}", e); return; }
+        Err(e) => {
+            eprintln!("HWP 파싱 오류: {:?}", e);
+            return;
+        }
     };
 
     let _ = doc.convert_to_editable_native();
 
     // 글상자 생성 (9000 x 6750 HWPUNIT)
-    let result = doc.create_shape_control_native(0, 0, 0, 9000, 6750, 0, 0, false, "InFrontOfText", "rectangle", false, false, &[]);
+    let result = doc.create_shape_control_native(
+        0,
+        0,
+        0,
+        9000,
+        6750,
+        0,
+        0,
+        false,
+        "InFrontOfText",
+        "rectangle",
+        false,
+        false,
+        &[],
+    );
     match &result {
         Ok(r) => eprintln!("글상자 생성 성공: {}", r),
-        Err(e) => { eprintln!("글상자 생성 실패: {:?}", e); return; }
+        Err(e) => {
+            eprintln!("글상자 생성 실패: {:?}", e);
+            return;
+        }
     }
 
     match doc.export_hwp_native() {
@@ -2135,12 +2970,18 @@ fn test_caption(args: &[String]) {
 
     let data = match fs::read(&args[0]) {
         Ok(d) => d,
-        Err(e) => { eprintln!("파일 읽기 오류: {}", e); return; }
+        Err(e) => {
+            eprintln!("파일 읽기 오류: {}", e);
+            return;
+        }
     };
 
     let mut doc = match rhwp::wasm_api::HwpDocument::from_bytes(&data) {
         Ok(d) => d,
-        Err(e) => { eprintln!("파싱 오류: {}", e); return; }
+        Err(e) => {
+            eprintln!("파싱 오류: {}", e);
+            return;
+        }
     };
 
     // 문단 0: 컨트롤 2,3 / 문단 1: 컨트롤 0,1
@@ -2171,11 +3012,18 @@ fn test_caption(args: &[String]) {
         let section = &doc.document().sections[0];
         let p = &section.paragraphs[*para];
         if let rhwp::model::control::Control::Picture(pic) = &p.controls[*ci] {
-            println!("[{}] caption={:?}", i, pic.caption.as_ref().map(|c| {
-                format!("dir={:?}, paras={}, text={:?}",
-                    c.direction, c.paragraphs.len(),
-                    c.paragraphs.first().map(|p| &p.text))
-            }));
+            println!(
+                "[{}] caption={:?}",
+                i,
+                pic.caption.as_ref().map(|c| {
+                    format!(
+                        "dir={:?}, paras={}, text={:?}",
+                        c.direction,
+                        c.paragraphs.len(),
+                        c.paragraphs.first().map(|p| &p.text)
+                    )
+                })
+            );
         }
     }
 
@@ -2196,20 +3044,27 @@ fn test_caption(args: &[String]) {
 fn gen_table(args: &[String]) {
     let rows: u16 = args.first().and_then(|s| s.parse().ok()).unwrap_or(1000);
     let cols: u16 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(6);
-    let output = args.get(2).map(|s| s.as_str()).unwrap_or("output/gen_table.hwp");
+    let output = args
+        .get(2)
+        .map(|s| s.as_str())
+        .unwrap_or("output/gen_table.hwp");
 
     println!("{}행 × {}열 표 생성 중...", rows, cols);
 
     let mut core = rhwp::document_core::DocumentCore::new_empty();
-    core.create_blank_document_native().expect("빈 문서 생성 실패");
+    core.create_blank_document_native()
+        .expect("빈 문서 생성 실패");
 
     // 표 생성
-    let result = core.create_table_native(0, 0, 0, rows, cols)
+    let result = core
+        .create_table_native(0, 0, 0, rows, cols)
         .expect("표 생성 실패");
     println!("  표 생성: {}", result);
 
     // 결과에서 paraIdx 파싱
-    let table_para_idx: usize = result.split("\"paraIdx\":").nth(1)
+    let table_para_idx: usize = result
+        .split("\"paraIdx\":")
+        .nth(1)
         .and_then(|s| s.split(&[',', '}'][..]).next())
         .and_then(|s| s.trim().parse().ok())
         .unwrap_or(1);
@@ -2235,12 +3090,23 @@ fn gen_table(args: &[String]) {
                 1 => format!("홍길동{}", row),
                 2 => departments[row % departments.len()].to_string(),
                 3 => positions[row % positions.len()].to_string(),
-                4 => format!("010-{:04}-{:04}", 1000 + row % 9000, 1000 + (row * 7) % 9000),
-                5 => if row % 3 == 0 { "특이사항 없음".to_string() } else { String::new() },
+                4 => format!(
+                    "010-{:04}-{:04}",
+                    1000 + row % 9000,
+                    1000 + (row * 7) % 9000
+                ),
+                5 => {
+                    if row % 3 == 0 {
+                        "특이사항 없음".to_string()
+                    } else {
+                        String::new()
+                    }
+                }
                 _ => format!("R{}C{}", row, col),
             };
             if !text.is_empty() {
-                let _ = core.insert_text_in_cell_native(0, table_para_idx, 0, cell_idx, 0, 0, &text);
+                let _ =
+                    core.insert_text_in_cell_native(0, table_para_idx, 0, cell_idx, 0, 0, &text);
             }
         }
         if row % 100 == 0 {
@@ -2262,12 +3128,17 @@ fn gen_table(args: &[String]) {
 }
 
 fn test_field_roundtrip(args: &[String]) {
-    let input = args.first().map(|s| s.as_str()).unwrap_or("hwp_webctl/bsbc01_10_000.hwp");
-    let output = args.get(1).map(|s| s.as_str()).unwrap_or("output/field_test.hwp");
+    let input = args
+        .first()
+        .map(|s| s.as_str())
+        .unwrap_or("hwp_webctl/bsbc01_10_000.hwp");
+    let output = args
+        .get(1)
+        .map(|s| s.as_str())
+        .unwrap_or("output/field_test.hwp");
 
     let data = std::fs::read(input).expect("파일 읽기 실패");
-    let mut core = rhwp::document_core::DocumentCore::from_bytes(&data)
-        .expect("문서 파싱 실패");
+    let mut core = rhwp::document_core::DocumentCore::from_bytes(&data).expect("문서 파싱 실패");
 
     // 1. 필드 목록 출력
     let fields = core.collect_all_fields();
@@ -2315,8 +3186,7 @@ fn test_field_roundtrip(args: &[String]) {
     println!("\n저장: {} ({}바이트)", output, saved.len());
 
     // 5. 재로딩 → 필드 확인
-    let mut core2 = rhwp::document_core::DocumentCore::from_bytes(&saved)
-        .expect("재로딩 실패");
+    let mut core2 = rhwp::document_core::DocumentCore::from_bytes(&saved).expect("재로딩 실패");
     let fields3 = core2.collect_all_fields();
     println!("\n=== 재로딩 후 확인 ===");
     for fi in &fields3 {
@@ -2347,35 +3217,59 @@ fn ir_diff(args: &[String]) {
                 para_filter = args[i + 1].parse().ok();
                 i += 2;
             }
-            _ => { i += 1; }
+            _ => {
+                i += 1;
+            }
         }
     }
 
     let data_a = match fs::read(file_a) {
         Ok(d) => d,
-        Err(e) => { eprintln!("오류: {} 읽기 실패: {}", file_a, e); return; }
+        Err(e) => {
+            eprintln!("오류: {} 읽기 실패: {}", file_a, e);
+            return;
+        }
     };
     let data_b = match fs::read(file_b) {
         Ok(d) => d,
-        Err(e) => { eprintln!("오류: {} 읽기 실패: {}", file_b, e); return; }
+        Err(e) => {
+            eprintln!("오류: {} 읽기 실패: {}", file_b, e);
+            return;
+        }
     };
 
     let doc_a = match rhwp::parser::parse_document(&data_a) {
         Ok(d) => d,
-        Err(e) => { eprintln!("오류: {} 파싱 실패: {:?}", file_a, e); return; }
+        Err(e) => {
+            eprintln!("오류: {} 파싱 실패: {:?}", file_a, e);
+            return;
+        }
     };
     let doc_b = match rhwp::parser::parse_document(&data_b) {
         Ok(d) => d,
-        Err(e) => { eprintln!("오류: {} 파싱 실패: {:?}", file_b, e); return; }
+        Err(e) => {
+            eprintln!("오류: {} 파싱 실패: {:?}", file_b, e);
+            return;
+        }
     };
 
-    let name_a = Path::new(file_a).file_name().unwrap_or_default().to_string_lossy();
-    let name_b = Path::new(file_b).file_name().unwrap_or_default().to_string_lossy();
+    let name_a = Path::new(file_a)
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy();
+    let name_b = Path::new(file_b)
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy();
     println!("=== IR 비교: {} vs {} ===", name_a, name_b);
 
     // 구역 수 비교
     if doc_a.sections.len() != doc_b.sections.len() {
-        println!("[차이] 구역 수: A={} vs B={}", doc_a.sections.len(), doc_b.sections.len());
+        println!(
+            "[차이] 구역 수: A={} vs B={}",
+            doc_a.sections.len(),
+            doc_b.sections.len()
+        );
     }
 
     let sec_count = doc_a.sections.len().min(doc_b.sections.len());
@@ -2383,21 +3277,30 @@ fn ir_diff(args: &[String]) {
 
     for sec_idx in 0..sec_count {
         if let Some(sf) = section_filter {
-            if sec_idx != sf { continue; }
+            if sec_idx != sf {
+                continue;
+            }
         }
 
         let sec_a = &doc_a.sections[sec_idx];
         let sec_b = &doc_b.sections[sec_idx];
 
         if sec_a.paragraphs.len() != sec_b.paragraphs.len() {
-            println!("[차이] 구역 {}: 문단 수 A={} vs B={}", sec_idx, sec_a.paragraphs.len(), sec_b.paragraphs.len());
+            println!(
+                "[차이] 구역 {}: 문단 수 A={} vs B={}",
+                sec_idx,
+                sec_a.paragraphs.len(),
+                sec_b.paragraphs.len()
+            );
             total_diffs += 1;
         }
 
         let para_count = sec_a.paragraphs.len().min(sec_b.paragraphs.len());
         for pi in 0..para_count {
             if let Some(pf) = para_filter {
-                if pi != pf { continue; }
+                if pi != pf {
+                    continue;
+                }
             }
 
             let pa = &sec_a.paragraphs[pi];
@@ -2406,9 +3309,11 @@ fn ir_diff(args: &[String]) {
 
             // 텍스트 비교
             if pa.text != pb.text {
-                diffs.push(format!("text: A={:?} vs B={:?}",
+                diffs.push(format!(
+                    "text: A={:?} vs B={:?}",
                     pa.text.chars().take(30).collect::<String>(),
-                    pb.text.chars().take(30).collect::<String>()));
+                    pb.text.chars().take(30).collect::<String>()
+                ));
             }
 
             // char_count 비교
@@ -2423,7 +3328,10 @@ fn ir_diff(args: &[String]) {
                 if len_a != len_b {
                     diffs.push(format!("char_offsets len: A={} vs B={}", len_a, len_b));
                 } else {
-                    let first_diff = pa.char_offsets.iter().zip(pb.char_offsets.iter())
+                    let first_diff = pa
+                        .char_offsets
+                        .iter()
+                        .zip(pb.char_offsets.iter())
                         .enumerate()
                         .find(|(_, (a, b))| a != b);
                     if let Some((idx, (a, b))) = first_diff {
@@ -2434,14 +3342,26 @@ fn ir_diff(args: &[String]) {
 
             // para_shape_id 비교
             if pa.para_shape_id != pb.para_shape_id {
-                diffs.push(format!("ps_id: A={} vs B={}", pa.para_shape_id, pb.para_shape_id));
+                diffs.push(format!(
+                    "ps_id: A={} vs B={}",
+                    pa.para_shape_id, pb.para_shape_id
+                ));
             }
 
             // tab_extended 비교
             if pa.tab_extended.len() != pb.tab_extended.len() {
-                diffs.push(format!("tab_ext count: A={} vs B={}", pa.tab_extended.len(), pb.tab_extended.len()));
+                diffs.push(format!(
+                    "tab_ext count: A={} vs B={}",
+                    pa.tab_extended.len(),
+                    pb.tab_extended.len()
+                ));
             } else {
-                for (ti, (ta, tb)) in pa.tab_extended.iter().zip(pb.tab_extended.iter()).enumerate() {
+                for (ti, (ta, tb)) in pa
+                    .tab_extended
+                    .iter()
+                    .zip(pb.tab_extended.iter())
+                    .enumerate()
+                {
                     if ta != tb {
                         diffs.push(format!("tab_ext[{}]: A={:?} vs B={:?}", ti, ta, tb));
                         break;
@@ -2451,37 +3371,64 @@ fn ir_diff(args: &[String]) {
 
             // LINE_SEG 비교
             if pa.line_segs.len() != pb.line_segs.len() {
-                diffs.push(format!("line_segs count: A={} vs B={}", pa.line_segs.len(), pb.line_segs.len()));
+                diffs.push(format!(
+                    "line_segs count: A={} vs B={}",
+                    pa.line_segs.len(),
+                    pb.line_segs.len()
+                ));
             } else {
                 for (li, (la, lb)) in pa.line_segs.iter().zip(pb.line_segs.iter()).enumerate() {
                     if la.text_start != lb.text_start {
-                        diffs.push(format!("ls[{}].ts: A={} vs B={}", li, la.text_start, lb.text_start));
+                        diffs.push(format!(
+                            "ls[{}].ts: A={} vs B={}",
+                            li, la.text_start, lb.text_start
+                        ));
                     }
                     if la.line_height != lb.line_height {
-                        diffs.push(format!("ls[{}].lh: A={} vs B={}", li, la.line_height, lb.line_height));
+                        diffs.push(format!(
+                            "ls[{}].lh: A={} vs B={}",
+                            li, la.line_height, lb.line_height
+                        ));
                     }
                     if la.segment_width != lb.segment_width {
-                        diffs.push(format!("ls[{}].sw: A={} vs B={}", li, la.segment_width, lb.segment_width));
+                        diffs.push(format!(
+                            "ls[{}].sw: A={} vs B={}",
+                            li, la.segment_width, lb.segment_width
+                        ));
                     }
                 }
             }
 
             // 컨트롤 수 비교
             if pa.controls.len() != pb.controls.len() {
-                diffs.push(format!("controls: A={} vs B={}", pa.controls.len(), pb.controls.len()));
+                diffs.push(format!(
+                    "controls: A={} vs B={}",
+                    pa.controls.len(),
+                    pb.controls.len()
+                ));
             }
 
             // char_shapes 비교
             if pa.char_shapes.len() != pb.char_shapes.len() {
-                diffs.push(format!("char_shapes count: A={} vs B={}", pa.char_shapes.len(), pb.char_shapes.len()));
+                diffs.push(format!(
+                    "char_shapes count: A={} vs B={}",
+                    pa.char_shapes.len(),
+                    pb.char_shapes.len()
+                ));
             } else {
                 for (ci, (ca, cb)) in pa.char_shapes.iter().zip(pb.char_shapes.iter()).enumerate() {
                     if ca.start_pos != cb.start_pos {
-                        diffs.push(format!("cs[{}].pos: A={} vs B={}", ci, ca.start_pos, cb.start_pos));
+                        diffs.push(format!(
+                            "cs[{}].pos: A={} vs B={}",
+                            ci, ca.start_pos, cb.start_pos
+                        ));
                         break;
                     }
                     if ca.char_shape_id != cb.char_shape_id {
-                        diffs.push(format!("cs[{}].id: A={} vs B={}", ci, ca.char_shape_id, cb.char_shape_id));
+                        diffs.push(format!(
+                            "cs[{}].id: A={} vs B={}",
+                            ci, ca.char_shape_id, cb.char_shape_id
+                        ));
                         break;
                     }
                 }
@@ -2503,20 +3450,39 @@ fn ir_diff(args: &[String]) {
         let ps_a = &doc_a.doc_info.para_shapes;
         let ps_b = &doc_b.doc_info.para_shapes;
         if ps_a.len() != ps_b.len() {
-            println!("\n[차이] ParaShape 수: A={} vs B={}", ps_a.len(), ps_b.len());
+            println!(
+                "\n[차이] ParaShape 수: A={} vs B={}",
+                ps_a.len(),
+                ps_b.len()
+            );
             total_diffs += 1;
         }
         let ps_count = ps_a.len().min(ps_b.len());
         for i in 0..ps_count {
-            let a = &ps_a[i]; let b = &ps_b[i];
+            let a = &ps_a[i];
+            let b = &ps_b[i];
             let mut ps_diffs: Vec<String> = Vec::new();
-            if a.margin_left != b.margin_left { ps_diffs.push(format!("ml: {}vs{}", a.margin_left, b.margin_left)); }
-            if a.margin_right != b.margin_right { ps_diffs.push(format!("mr: {}vs{}", a.margin_right, b.margin_right)); }
-            if a.indent != b.indent { ps_diffs.push(format!("indent: {}vs{}", a.indent, b.indent)); }
-            if a.tab_def_id != b.tab_def_id { ps_diffs.push(format!("tab_def: {}vs{}", a.tab_def_id, b.tab_def_id)); }
-            if a.spacing_before != b.spacing_before { ps_diffs.push(format!("sb: {}vs{}", a.spacing_before, b.spacing_before)); }
-            if a.spacing_after != b.spacing_after { ps_diffs.push(format!("sa: {}vs{}", a.spacing_after, b.spacing_after)); }
-            if a.line_spacing != b.line_spacing { ps_diffs.push(format!("ls: {}vs{}", a.line_spacing, b.line_spacing)); }
+            if a.margin_left != b.margin_left {
+                ps_diffs.push(format!("ml: {}vs{}", a.margin_left, b.margin_left));
+            }
+            if a.margin_right != b.margin_right {
+                ps_diffs.push(format!("mr: {}vs{}", a.margin_right, b.margin_right));
+            }
+            if a.indent != b.indent {
+                ps_diffs.push(format!("indent: {}vs{}", a.indent, b.indent));
+            }
+            if a.tab_def_id != b.tab_def_id {
+                ps_diffs.push(format!("tab_def: {}vs{}", a.tab_def_id, b.tab_def_id));
+            }
+            if a.spacing_before != b.spacing_before {
+                ps_diffs.push(format!("sb: {}vs{}", a.spacing_before, b.spacing_before));
+            }
+            if a.spacing_after != b.spacing_after {
+                ps_diffs.push(format!("sa: {}vs{}", a.spacing_after, b.spacing_after));
+            }
+            if a.line_spacing != b.line_spacing {
+                ps_diffs.push(format!("ls: {}vs{}", a.line_spacing, b.line_spacing));
+            }
             if !ps_diffs.is_empty() {
                 println!("  [PS {}] {}", i, ps_diffs.join(", "));
                 total_diffs += ps_diffs.len() as u32;
@@ -2534,15 +3500,33 @@ fn ir_diff(args: &[String]) {
         }
         let td_count = td_a.len().min(td_b.len());
         for i in 0..td_count {
-            let a = &td_a[i]; let b = &td_b[i];
+            let a = &td_a[i];
+            let b = &td_b[i];
             if a.tabs.len() != b.tabs.len() {
-                println!("  [TD {}] 탭 수: A={} vs B={}", i, a.tabs.len(), b.tabs.len());
+                println!(
+                    "  [TD {}] 탭 수: A={} vs B={}",
+                    i,
+                    a.tabs.len(),
+                    b.tabs.len()
+                );
                 total_diffs += 1;
             } else {
                 for (ti, (ta, tb)) in a.tabs.iter().zip(b.tabs.iter()).enumerate() {
-                    if ta.position != tb.position || ta.tab_type != tb.tab_type || ta.fill_type != tb.fill_type {
-                        println!("  [TD {}][{}] pos: {}vs{}, type: {}vs{}, fill: {}vs{}",
-                            i, ti, ta.position, tb.position, ta.tab_type, tb.tab_type, ta.fill_type, tb.fill_type);
+                    if ta.position != tb.position
+                        || ta.tab_type != tb.tab_type
+                        || ta.fill_type != tb.fill_type
+                    {
+                        println!(
+                            "  [TD {}][{}] pos: {}vs{}, type: {}vs{}, fill: {}vs{}",
+                            i,
+                            ti,
+                            ta.position,
+                            tb.position,
+                            ta.tab_type,
+                            tb.tab_type,
+                            ta.fill_type,
+                            tb.fill_type
+                        );
                         total_diffs += 1;
                     }
                 }
@@ -2636,8 +3620,14 @@ fn extract_thumbnail(args: &[String]) {
 
             match fs::write(&out, &result.data) {
                 Ok(_) => {
-                    println!("썸네일 추출 완료: {} ({}x{}, {} bytes, {})",
-                        out, result.width, result.height, result.data.len(), result.format);
+                    println!(
+                        "썸네일 추출 완료: {} ({}x{}, {} bytes, {})",
+                        out,
+                        result.width,
+                        result.height,
+                        result.data.len(),
+                        result.format
+                    );
                 }
                 Err(e) => {
                     eprintln!("오류: 파일 저장 실패: {} ({})", out, e);
