@@ -8,7 +8,7 @@
 //!   `control.rs` 등은 변경하지 않는다.
 //! - **IR 만 만진다**: 진입점은 `&mut Document` 이며, 출력은 IR 필드 갱신뿐.
 //! - **idempotent**: 같은 IR 에 두 번 호출해도 같은 결과.
-//! - **HWP 출처 보호**: `source_format == Hwpx` 일 때만 동작. HWP 출처는 no-op.
+//! - **HWP 출처 보호**: `source_format == Hwpx|Hwpml` 일 때만 동작. HWP 출처는 no-op.
 //!
 //! ## 매핑 명세서
 //!
@@ -207,12 +207,12 @@ fn adapt_cell_list_attr(cell: &mut Cell, report: &mut AdapterReport) {
     }
 }
 
-/// `source_format` 검사 후 어댑터를 호출하는 보조 함수.
+/// `source_format` 검사 후 XML 출처(HWPX/HWPML)에만 어댑터를 호출하는 보조 함수.
 ///
 /// 호출자: `DocumentCore::export_hwp_with_adapter()` (Stage 5 에서 추가).
 pub fn convert_if_hwpx_source(doc: &mut Document, source_format: FileFormat) -> AdapterReport {
-    if source_format != FileFormat::Hwpx {
-        return AdapterReport::new().no_op("source_format != Hwpx");
+    if !matches!(source_format, FileFormat::Hwpx | FileFormat::Hwpml) {
+        return AdapterReport::new().no_op("source_format != Hwpx|Hwpml");
     }
     convert_hwpx_to_hwp_ir(doc)
 }
@@ -233,7 +233,7 @@ mod tests {
     fn hwp_source_no_op_via_filter() {
         let mut doc = Document::default();
         let report = convert_if_hwpx_source(&mut doc, FileFormat::Hwp);
-        assert_eq!(report.skipped_reason.as_deref(), Some("source_format != Hwpx"));
+        assert_eq!(report.skipped_reason.as_deref(), Some("source_format != Hwpx|Hwpml"));
     }
 
     #[test]

@@ -102,7 +102,10 @@ fn adapter_deterministic_across_clones() {
 fn adapter_skips_hwp_source() {
     let mut doc = rhwp::model::document::Document::default();
     let report = convert_if_hwpx_source(&mut doc, rhwp::parser::FileFormat::Hwp);
-    assert_eq!(report.skipped_reason.as_deref(), Some("source_format != Hwpx"));
+    assert_eq!(
+        report.skipped_reason.as_deref(),
+        Some("source_format != Hwpx|Hwpml")
+    );
 }
 
 // ============================================================
@@ -384,7 +387,7 @@ fn stage5_export_hwp_with_adapter_hwpx_source_recovers_pages() {
 
 #[test]
 fn stage5_export_hwp_with_adapter_hwp_source_unchanged() {
-    // HWP 원본 — 어댑터는 no-op (source_format != Hwpx)
+    // HWP 원본 — 어댑터는 no-op (source_format != Hwpx|Hwpml)
     let path = "samples/hwp_table_test.hwp";
     let bytes = match std::fs::read(path) {
         Ok(b) => b,

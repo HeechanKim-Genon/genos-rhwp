@@ -56,7 +56,10 @@ impl DocumentCore {
         // HWPX 파서가 채우지 않는 paragraph 필드를 HWP 직렬화/파싱 라운드트립 결과와 일치시킨다.
         // 1) char_shapes 빈 paragraph 에 default [(0,0)] 추가 (HWP 스펙상 최소 1개 요구)
         // 2) control_mask 를 controls 기반으로 재계산
-        if matches!(source_format, crate::parser::FileFormat::Hwpx) {
+        if matches!(
+            source_format,
+            crate::parser::FileFormat::Hwpx | crate::parser::FileFormat::Hwpml
+        ) {
             Self::normalize_hwpx_paragraphs(&mut document);
         }
 
