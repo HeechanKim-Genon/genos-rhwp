@@ -87,6 +87,8 @@ fn resolve_metric_alias(name: &str) -> &str {
         "함초롬바탕" | "한컴바탕" => "HCR Batang",
         "바탕" => "Batang",  // 윈도우 TTF 바탕
         "맑은 고딕" => "Malgun Gothic",
+        "AppleMyungjo" => "Batang",
+        "Apple SD Gothic Neo" | "AppleGothic" => "Malgun Gothic",
         "나눔고딕" => "NanumGothic",
         "나눔명조" => "NanumMyeongjo",
         // 윈도우 시스템 폰트 (가변폭)

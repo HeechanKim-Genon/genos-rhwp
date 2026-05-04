@@ -16,17 +16,64 @@ fn create_fontdb() -> usvg::fontdb::Database {
     if std::path::Path::new("/mnt/c/Windows/Fonts").exists() {
         fontdb.load_fonts_dir("/mnt/c/Windows/Fonts");
     }
-    fontdb.set_serif_family("바탕");
-    fontdb.set_sans_serif_family("맑은 고딕");
-    fontdb.set_monospace_family("D2Coding");
+    #[cfg(target_os = "macos")]
+    {
+        fontdb.set_serif_family("AppleMyungjo");
+        fontdb.set_sans_serif_family("Apple SD Gothic Neo");
+        fontdb.set_monospace_family("Menlo");
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        fontdb.set_serif_family("바탕");
+        fontdb.set_sans_serif_family("맑은 고딕");
+        fontdb.set_monospace_family("D2Coding");
+    }
     fontdb
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn pdf_sans_fallback() -> &'static str {
+    #[cfg(target_os = "macos")]
+    {
+        "'Apple SD Gothic Neo','Apple Symbols','Arial Unicode MS','Noto Sans Symbols 2','Noto Sans Symbols','Symbola','AppleGothic','AppleMyungjo','Malgun Gothic','맑은 고딕','Noto Sans KR',sans-serif"
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        "'Malgun Gothic','맑은 고딕','Segoe UI Symbol','Arial Unicode MS','Noto Sans Symbols 2','Noto Sans Symbols','Symbola','Apple SD Gothic Neo','AppleGothic','Noto Sans KR',sans-serif"
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn pdf_serif_fallback() -> &'static str {
+    #[cfg(target_os = "macos")]
+    {
+        "'AppleMyungjo','Apple Symbols','Arial Unicode MS','Noto Sans Symbols 2','Noto Sans Symbols','Symbola','Times New Roman',serif"
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        "'바탕','Batang','Segoe UI Symbol','Arial Unicode MS','Noto Sans Symbols 2','Noto Sans Symbols','Symbola','Times New Roman',serif"
+    }
 }
 
 /// SVG에서 없는 한글 폰트명에 fallback 추가
 #[cfg(not(target_arch = "wasm32"))]
 fn add_font_fallbacks(svg: &str) -> String {
-    svg.replace("font-family=\"휴먼명조\"", "font-family=\"휴먼명조, 바탕, serif\"")
-       .replace("font-family=\"HCI Poppy\"", "font-family=\"HCI Poppy, 맑은 고딕, sans-serif\"")
+    svg.replace(
+        "font-family=\"sans-serif\"",
+        &format!("font-family=\"{}\"", pdf_sans_fallback()),
+    )
+    .replace(
+        "font-family=\"serif\"",
+        &format!("font-family=\"{}\"", pdf_serif_fallback()),
+    )
+    .replace(
+        "font-family=\"휴먼명조\"",
+        &format!("font-family=\"휴먼명조, {}\"", pdf_serif_fallback()),
+    )
+    .replace(
+        "font-family=\"HCI Poppy\"",
+        &format!("font-family=\"HCI Poppy, {}\"", pdf_sans_fallback()),
+    )
 }
 
 /// 단일 SVG를 PDF로 변환
