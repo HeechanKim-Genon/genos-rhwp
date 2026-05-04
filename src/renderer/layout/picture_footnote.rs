@@ -18,6 +18,22 @@ use super::utils::find_bin_data;
 use super::text_measurement::{resolved_to_text_style, estimate_text_width};
 
 impl LayoutEngine {
+    fn picture_original_size_px(
+        &self,
+        picture: &crate::model::image::Picture,
+    ) -> Option<(f64, f64)> {
+        let ow = picture.shape_attr.original_width;
+        let oh = picture.shape_attr.original_height;
+        if ow > 0 && oh > 0 {
+            Some((
+                hwpunit_to_px(ow as i32, self.dpi),
+                hwpunit_to_px(oh as i32, self.dpi),
+            ))
+        } else {
+            None
+        }
+    }
+
     pub(crate) fn layout_picture(
         &self,
         tree: &mut PageRenderTree,
@@ -80,6 +96,7 @@ impl LayoutEngine {
         let bin_data_id = picture.image_attr.bin_data_id;
         let image_data = find_bin_data(bin_data_content, bin_data_id)
             .map(|c| c.data.clone());
+        let original_size = self.picture_original_size_px(picture);
 
         // 그림 자르기: crop 좌표를 그대로 저장 (렌더러에서 이미지 px 크기와 비교)
         let crop = {
@@ -108,6 +125,7 @@ impl LayoutEngine {
                 section_index,
                 para_index,
                 control_index,
+                original_size,
                 crop,
                 original_size_hu,
                 effect: picture.image_attr.effect,
@@ -289,6 +307,7 @@ impl LayoutEngine {
         let bin_data_id = picture.image_attr.bin_data_id;
         let image_data = find_bin_data(bin_data_content, bin_data_id)
             .map(|c| c.data.clone());
+        let original_size = self.picture_original_size_px(picture);
 
         // 그림 자르기
         let crop = {
@@ -317,6 +336,7 @@ impl LayoutEngine {
                 section_index: Some(section_index),
                 para_index: Some(para_index),
                 control_index: Some(control_index),
+                original_size,
                 crop,
                 original_size_hu,
                 effect: picture.image_attr.effect,

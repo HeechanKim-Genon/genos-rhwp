@@ -630,6 +630,18 @@ impl LayoutEngine {
                             let bin_id = pic.image_attr.bin_data_id;
                             let img_data = find_bin_data(bin_data_content, bin_id)
                                 .map(|bd| bd.data.clone());
+                            let original_size = {
+                                let ow = pic.shape_attr.original_width;
+                                let oh = pic.shape_attr.original_height;
+                                if ow > 0 && oh > 0 {
+                                    Some((
+                                        hwpunit_to_px(ow as i32, self.dpi),
+                                        hwpunit_to_px(oh as i32, self.dpi),
+                                    ))
+                                } else {
+                                    None
+                                }
+                            };
                             let img_node_id = tree.next_id();
                             let img_node = RenderNode::new(
                                 img_node_id,
@@ -640,7 +652,7 @@ impl LayoutEngine {
                                     para_index: None,
                                     control_index: Some(ctrl_idx),
                                     fill_mode: None,
-                                    original_size: None,
+                                    original_size,
                                     transform: ShapeTransform::default(),
                                     crop: None,
                                     original_size_hu: None,
