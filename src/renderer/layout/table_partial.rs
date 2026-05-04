@@ -150,17 +150,26 @@ impl LayoutEngine {
         );
 
         // ── 4. 렌더링할 행 목록 구성 ──
-        // is_continuation && repeat_header → 제목행(0)에 제목 셀(is_header)이 있으면 반복
-        let render_header = is_continuation && table.repeat_header && start_row > 0
-            && table.cells.iter()
-                .filter(|c| c.row == 0)
-                .any(|c| c.is_header);
+        // is_continuation && repeat_header → 제목 셀이 걸치는 행 전체를 반복한다.
+        // 복수 행 헤더(rowspan/하위 헤더)가 있는 표에서 0행만 반복하면 continuation
+        // 조각의 헤더 높이와 병합 셀 계산이 어긋난다.
+        let header_end_row = table.cells.iter()
+            .filter(|c| c.is_header)
+            .map(|c| c.row as usize + c.row_span as usize)
+            .max()
+            .unwrap_or(0)
+            .min(row_count);
+        let render_header = is_continuation && table.repeat_header && start_row > 0 && header_end_row > 0;
         let mut render_rows: Vec<usize> = Vec::new();
         if render_header {
-            render_rows.push(0); // 제목행
+            for r in 0..header_end_row {
+                render_rows.push(r);
+            }
         }
         for r in start_row..end_row.min(row_count) {
-            render_rows.push(r);
+            if !render_header || r >= header_end_row {
+                render_rows.push(r);
+            }
         }
 
         // 렌더링 영역의 행별 y 위치 계산 (0부터 시작)
@@ -259,8 +268,9 @@ impl LayoutEngine {
             let render_range_end = end_row.min(row_count);
 
             // 제목행 반복으로 렌더링되는 셀인지 판별
-            // (원래 범위 밖이지만 render_header 때문에 포함되는 행0 셀)
-            let is_repeated_header_cell = render_header && cell_row == 0 && cell_end_row <= start_row;
+            // (원래 범위 밖이지만 render_header 때문에 포함되는 헤더 범위 셀)
+            let is_repeated_header_cell =
+                render_header && cell_row < header_end_row && cell_end_row <= start_row;
 
             // 셀이 렌더링 범위와 겹치는지 확인
             if cell_row >= render_range_end || cell_end_row <= render_range_start {
