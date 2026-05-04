@@ -34,11 +34,15 @@ pub type HwpmlError = hwpx::HwpxError;
 
 pub fn parse_hwpml(data: &[u8]) -> Result<Document, HwpmlError> {
     let xml = decode_xml(data)?;
-    if xml.contains("<HWPML") || xml.contains("<hwpml") {
+    if is_legacy_hwpml(&xml) {
         parse_legacy_hwpml(&xml)
     } else {
         parse_modern_hwpml(&xml)
     }
+}
+
+fn is_legacy_hwpml(xml: &str) -> bool {
+    xml.contains("<HWPML") && (xml.contains("<BODY") || xml.contains("<SECTION"))
 }
 
 fn parse_modern_hwpml(xml: &str) -> Result<Document, HwpmlError> {
