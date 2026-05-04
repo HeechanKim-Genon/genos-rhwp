@@ -9,6 +9,10 @@ Cargo.lock
 
 # Output (렌더링 결과물)
 /output/
+/output_svg/
+
+# 임의 추가한 samples
+/samples/
 
 # Docker
 .docker/

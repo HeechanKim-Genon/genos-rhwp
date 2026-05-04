@@ -24,6 +24,7 @@ pub mod control;
 pub mod crypto;
 pub mod doc_info;
 pub mod header;
+pub mod hwpml;
 pub mod hwpx;
 pub mod record;
 pub mod tags;
@@ -39,6 +40,8 @@ use crate::model::bin_data::BinDataContent;
 pub enum FileFormat {
     /// HWP 5.0 바이너리 (CFB/OLE 컨테이너)
     Hwp,
+    /// HWPML / OWPML 단일 XML 문서
+    Hwpml,
     /// HWPX (XML 기반, ZIP 컨테이너)
     Hwpx,
     /// HWP 3.0 바이너리 (미지원 — 감지만, Issue #265)
@@ -59,12 +62,46 @@ pub fn detect_format(data: &[u8]) -> FileFormat {
             return FileFormat::Hwpx;
         }
     }
+    if looks_like_hwpml_xml(data) {
+        return FileFormat::Hwpml;
+    }
     // HWP 3.0 바이너리 (Issue #265): "HWP Document File" 프리픽스.
     // V3.00 ~ 2.x/초기 한컴 워디안까지 관대하게 포괄.
     if data.len() >= 17 && &data[0..17] == b"HWP Document File" {
         return FileFormat::Hwp3;
     }
     FileFormat::Unknown
+}
+
+fn looks_like_hwpml_xml(data: &[u8]) -> bool {
+    let mut start = data;
+    if start.starts_with(&[0xEF, 0xBB, 0xBF]) {
+        start = &start[3..];
+    }
+    start = trim_ascii_start(start);
+    if !start.starts_with(b"<") {
+        return false;
+    }
+
+    let probe_len = start.len().min(8192);
+    let probe = String::from_utf8_lossy(&start[..probe_len]).to_ascii_lowercase();
+    probe.contains("hancom.co.kr/hwpml")
+        || probe.contains("owpml.org/owpml")
+        || probe.contains(":head")
+        || probe.contains(":sec")
+        || probe.contains("<head")
+        || probe.contains("<sec")
+}
+
+fn trim_ascii_start(mut data: &[u8]) -> &[u8] {
+    while let Some(first) = data.first() {
+        if first.is_ascii_whitespace() {
+            data = &data[1..];
+        } else {
+            break;
+        }
+    }
+    data
 }
 
 /// 파싱 에러 (통합)
@@ -530,6 +567,7 @@ impl DocumentParser for HwpxParser {
 /// 포맷 자동 감지 후 적절한 파서로 파싱
 pub fn parse_document(data: &[u8]) -> Result<Document, ParseError> {
     match detect_format(data) {
+        FileFormat::Hwpml => hwpml::parse_hwpml(data).map_err(ParseError::from),
         FileFormat::Hwpx => HwpxParser.parse(data),
         FileFormat::Hwp3 => Err(ParseError::UnsupportedFormat {
             format: "HWP 3.0",
@@ -804,6 +842,17 @@ mod tests {
     }
 
     #[test]
+    fn test_detect_format_hwpml_xml() {
+        let xml = br#"<?xml version="1.0" encoding="UTF-8"?>
+<hwpml xmlns:hh="http://www.hancom.co.kr/hwpml/2011/head"
+       xmlns:hs="http://www.hancom.co.kr/hwpml/2011/section">
+  <hh:head version="1.2" secCnt="1"/>
+  <hs:sec/>
+</hwpml>"#;
+        assert_eq!(detect_format(xml), FileFormat::Hwpml);
+    }
+
+    #[test]
     fn test_detect_format_unknown() {
         let data = [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
         assert_eq!(detect_format(&data), FileFormat::Unknown);
@@ -848,6 +897,26 @@ mod tests {
         // ZIP 시그니처 → HwpxParser 경로로 디스패치
         let result = parse_document(&[0x50, 0x4B, 0x03, 0x04, 0x00, 0x00, 0x00, 0x00]);
         assert!(result.is_err()); // 유효하지 않은 ZIP이므로 에러
+    }
+
+    #[test]
+    fn test_parse_document_dispatches_hwpml() {
+        let xml = br#"<?xml version="1.0" encoding="UTF-8"?>
+<hwpml xmlns:hh="http://www.hancom.co.kr/hwpml/2011/head"
+       xmlns:hs="http://www.hancom.co.kr/hwpml/2011/section">
+  <hh:head version="1.2" secCnt="1">
+    <hh:beginNum page="1" footnote="1" endnote="1" pic="1" tbl="1" equation="1"/>
+    <hh:refList>
+      <hh:fontfaces itemCnt="0"/>
+      <hh:charProperties itemCnt="0"/>
+      <hh:paraProperties itemCnt="0"/>
+      <hh:styles itemCnt="0"/>
+    </hh:refList>
+  </hh:head>
+  <hs:sec/>
+</hwpml>"#;
+        let result = parse_document(xml);
+        assert!(result.is_ok(), "HWPML XML should parse: {result:?}");
     }
 
     #[test]
