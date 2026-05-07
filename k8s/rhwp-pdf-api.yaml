@@ -1,0 +1,55 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rhwp-pdf-api
+  labels:
+    app: rhwp-pdf-api
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: rhwp-pdf-api
+  template:
+    metadata:
+      labels:
+        app: rhwp-pdf-api
+    spec:
+      containers:
+        - name: rhwp-pdf-api
+          image: rhwp-pdf-api:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 7878
+              name: http
+          readinessProbe:
+            tcpSocket:
+              port: 7878
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          livenessProbe:
+            tcpSocket:
+              port: 7878
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "512Mi"
+            limits:
+              cpu: "1"
+              memory: "2Gi"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: rhwp-pdf-api
+  labels:
+    app: rhwp-pdf-api
+spec:
+  type: ClusterIP
+  selector:
+    app: rhwp-pdf-api
+  ports:
+    - name: http
+      port: 7878
+      targetPort: 7878

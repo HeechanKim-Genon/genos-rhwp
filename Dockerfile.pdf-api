@@ -1,0 +1,27 @@
+FROM rust:latest AS builder
+
+WORKDIR /app
+
+COPY Cargo.toml Cargo.lock ./
+COPY src ./src
+COPY ttfs ./ttfs
+
+RUN cargo build --release --bin rhwp
+
+FROM debian:bookworm-slim
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        fontconfig \
+        fonts-noto-cjk \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY --from=builder /app/target/release/rhwp /usr/local/bin/rhwp
+COPY --from=builder /app/ttfs /app/ttfs
+
+EXPOSE 7878
+
+CMD ["rhwp", "serve-pdf", "--host", "0.0.0.0", "--port", "7878"]
