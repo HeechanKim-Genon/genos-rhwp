@@ -48,6 +48,7 @@ usvg = "0.45"
 pdf-writer = "0.12"
 subsetter = "0.2"
 ttf-parser = "0.25"
+regex = "1"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 web-sys = { version = "0.3", features = [
